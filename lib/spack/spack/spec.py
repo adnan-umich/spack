@@ -896,7 +896,7 @@ class CompilerFlag(str):
         return obj
 
 
-_valid_compiler_flags = ["cflags", "cxxflags", "fflags", "ldflags", "ldlibs", "cppflags"]
+_valid_compiler_flags = ("cflags", "cxxflags", "fflags", "ldflags", "ldlibs", "cppflags")
 
 
 def _shared_subset_pair_iterate(container1, container2):
@@ -1421,6 +1421,8 @@ def tree(
 
 
 class SpecAnnotations:
+    __slots__ = ("original_spec_format", "compiler_node_attribute")
+
     def __init__(self) -> None:
         self.original_spec_format = SPECFILE_FORMAT_VERSION
         self.compiler_node_attribute: Optional["Spec"] = None
@@ -1587,8 +1589,10 @@ class Spec:
         self.abstract_hash = None
 
         # initial values for all spec hash types
-        for h in ht.HASHES:
-            setattr(self, h.attr, None)
+        self._hash = None
+        self._package_hash = None
+        self._full_hash = None
+        self._build_hash = None
 
         # cache for spec's prefix, computed lazily by prefix property
         self._prefix = None
@@ -1605,7 +1609,10 @@ class Spec:
         # External detection details that can be set by internal Spack calls
         # in the constructor.
         self._external_path = external_path
-        self.external_modules = Spec._format_module_list(external_modules)
+        if external_modules:
+            self.external_modules = list(external_modules)
+        else:
+            self.external_modules = None
 
         # This attribute is used to store custom information for external specs.
         self.extra_attributes: Dict[str, Any] = {}
@@ -1622,24 +1629,6 @@ class Spec:
 
         elif spec_like is not None:
             raise TypeError(f"Can't make spec out of {type(spec_like)}")
-
-    @staticmethod
-    def _format_module_list(modules):
-        """Return a module list that is suitable for YAML serialization
-        and hash computation.
-
-        Given a module list, possibly read from a configuration file,
-        return an object that serializes to a consistent YAML string
-        before/after round-trip serialization to/from a Spec dictionary
-        (stored in JSON format): when read in, the module list may
-        contain YAML formatting that is discarded (non-essential)
-        when stored as a Spec dictionary; we take care in this function
-        to discard such formatting such that the Spec hash does not
-        change before/after storage in JSON.
-        """
-        if modules:
-            modules = list(modules)
-        return modules
 
     @property
     def external_path(self):
@@ -1824,7 +1813,6 @@ class Spec:
                 f"Propagation with '==' is not supported for '{name}'."
             )
 
-        valid_flags = FlagMap.valid_compiler_flags()
         if name == "arch" or name == "architecture":
             assert type(value) is str, "architecture have a string value"
             parts = tuple(value.split("-"))
@@ -1838,7 +1826,7 @@ class Spec:
             self._set_architecture(target=value)
         elif name == "namespace":
             self.namespace = value
-        elif name in valid_flags:
+        elif name in _valid_compiler_flags:
             assert self.compiler_flags is not None
             assert type(value) is str, f"{name} must have a string value"
             flags_and_propagation = spack.compilers.flags.tokenize_flags(value, propagate)

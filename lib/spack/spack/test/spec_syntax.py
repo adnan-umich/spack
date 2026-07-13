@@ -40,7 +40,7 @@ SKIP_ON_UNIX = pytest.mark.skipif(sys.platform != "win32", reason="Windows style
 
 
 def Token(kind, value, **kwargs):
-    return (kind, value, {f"{kind}_{k}": v for k, v in kwargs.items()})
+    return (kind, value, dict(kwargs))
 
 
 def simple_package_name(name):
@@ -636,7 +636,14 @@ def specfile_for(default_mock_concretization):
         ),
         (
             "^mpi=openmpi",
-            [Token("DEPENDENCY", value="^mpi=openmpi", virtuals="mpi", substitute="openmpi")],
+            [
+                Token(
+                    "DEPENDENCY",
+                    value="^mpi=openmpi",
+                    edge_virtuals="mpi",
+                    edge_substitute="openmpi",
+                )
+            ],
             "^mpi=openmpi",
         ),
         # Allow merging attributes, if deptypes match
@@ -662,8 +669,8 @@ def specfile_for(default_mock_concretization):
                 Token(
                     "DEPENDENCY",
                     value="^lapack,mpi=openmpi",
-                    virtuals="lapack,mpi",
-                    substitute="openmpi",
+                    edge_virtuals="lapack,mpi",
+                    edge_substitute="openmpi",
                 ),
                 Token("BOOL_VARIANT", value="+foo", bv_prefix="+", bv_name="foo"),
                 Token("BOOL_VARIANT", value="+bar", bv_prefix="+", bv_name="bar"),
@@ -743,7 +750,7 @@ def specfile_for(default_mock_concretization):
             "zlib %c=gcc",
             [
                 Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
-                Token("DEPENDENCY", value="%c=gcc", virtuals="c", substitute="gcc"),
+                Token("DEPENDENCY", value="%c=gcc", edge_virtuals="c", edge_substitute="gcc"),
             ],
             "zlib %c=gcc",
         ),
@@ -762,7 +769,9 @@ def specfile_for(default_mock_concretization):
             "zlib %c,cxx=gcc",
             [
                 Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
-                Token("DEPENDENCY", value="%c,cxx=gcc", virtuals="c,cxx", substitute="gcc"),
+                Token(
+                    "DEPENDENCY", value="%c,cxx=gcc", edge_virtuals="c,cxx", edge_substitute="gcc"
+                ),
             ],
             "zlib %c,cxx=gcc",
         ),
@@ -788,7 +797,9 @@ def specfile_for(default_mock_concretization):
             "zlib %c,cxx=gcc@14.1",
             [
                 Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
-                Token("DEPENDENCY", value="%c,cxx=gcc", virtuals="c,cxx", substitute="gcc"),
+                Token(
+                    "DEPENDENCY", value="%c,cxx=gcc", edge_virtuals="c,cxx", edge_substitute="gcc"
+                ),
                 Token("VERSION", value="@14.1", version_list="14.1"),
             ],
             "zlib %c,cxx=gcc@14.1",
@@ -825,9 +836,19 @@ def specfile_for(default_mock_concretization):
             "zlib %fortran=gcc@14.1 %c,cxx=clang",
             [
                 Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
-                Token("DEPENDENCY", value="%fortran=gcc", virtuals="fortran", substitute="gcc"),
+                Token(
+                    "DEPENDENCY",
+                    value="%fortran=gcc",
+                    edge_virtuals="fortran",
+                    edge_substitute="gcc",
+                ),
                 Token("VERSION", value="@14.1", version_list="14.1"),
-                Token("DEPENDENCY", value="%c,cxx=clang", virtuals="c,cxx", substitute="clang"),
+                Token(
+                    "DEPENDENCY",
+                    value="%c,cxx=clang",
+                    edge_virtuals="c,cxx",
+                    edge_substitute="clang",
+                ),
             ],
             "zlib %fortran=gcc@14.1 %c,cxx=clang",
         ),
@@ -897,7 +918,12 @@ def specfile_for(default_mock_concretization):
                 Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
                 Token("DEPENDENCY", "^[", edge_bracket="["),
                 Token("KEY_VALUE_PAIR", "when='%c'", kv_name="when", kv_sep="=", kv_value="'%c'"),
-                Token("END_EDGE_PROPERTIES", "] c=gcc", virtuals="c", substitute="gcc"),
+                Token(
+                    "END_EDGE_PROPERTIES",
+                    "] c=gcc",
+                    end_edge_virtuals="c",
+                    end_edge_substitute="gcc",
+                ),
             ],
             "foo ^[when='%c'] c=gcc",
         ),
@@ -915,7 +941,7 @@ def specfile_for(default_mock_concretization):
             "foo %%c,cxx=gcc",
             [
                 Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
-                Token("DEPENDENCY", "%%c,cxx=gcc", virtuals="c,cxx", substitute="gcc"),
+                Token("DEPENDENCY", "%%c,cxx=gcc", edge_virtuals="c,cxx", edge_substitute="gcc"),
             ],
             "foo %%c,cxx=gcc",
         ),
@@ -925,7 +951,12 @@ def specfile_for(default_mock_concretization):
                 Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
                 Token("DEPENDENCY", "%%[", edge_bracket="["),
                 Token("KEY_VALUE_PAIR", "when='%c'", kv_name="when", kv_sep="=", kv_value="'%c'"),
-                Token("END_EDGE_PROPERTIES", "] c=gcc", virtuals="c", substitute="gcc"),
+                Token(
+                    "END_EDGE_PROPERTIES",
+                    "] c=gcc",
+                    end_edge_virtuals="c",
+                    end_edge_substitute="gcc",
+                ),
             ],
             "foo %%[when='%c'] c=gcc",
         ),

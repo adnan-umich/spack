@@ -143,7 +143,7 @@ class SpecTokenizationError(spack.error.SpecSyntaxError):
             match = scanner.match()
             if not match:
                 break
-            elif match.lastgroup == "UNEXPECTED":
+            elif match.lastgroup == _UNEXPECTED:
                 unexpected_indices.append(match.start(match.lastgroup))
 
         underline = ""
@@ -381,6 +381,32 @@ class SpecTokens(TokenBase):
 #: Global regex matching any token (and its named subgroups) after optional whitespace
 FAST_SPEC_REGEX = fast_regex(SpecTokens)
 
+# Aliases for token names. This avoids a function call to SpecTokens.<token>.name in the parser.
+_END_EDGE_PROPERTIES = SpecTokens.END_EDGE_PROPERTIES.name
+_DEPENDENCY = SpecTokens.DEPENDENCY.name
+_VERSION = SpecTokens.VERSION.name
+_BOOL_VARIANT = SpecTokens.BOOL_VARIANT.name
+_KEY_VALUE_PAIR = SpecTokens.KEY_VALUE_PAIR.name
+_FILENAME = SpecTokens.FILENAME.name
+_FULLY_QUALIFIED_PACKAGE_NAME = SpecTokens.FULLY_QUALIFIED_PACKAGE_NAME.name
+_UNQUALIFIED_PACKAGE_NAME = SpecTokens.UNQUALIFIED_PACKAGE_NAME.name
+_DAG_HASH = SpecTokens.DAG_HASH.name
+_UNEXPECTED = SpecTokens.UNEXPECTED.name
+
+# Names of token subgroups in FAST_SPEC_REGEX.
+_EDGE_BRACKET = f"{SpecTokens.DEPENDENCY.name}_edge_bracket"
+_EDGE_VIRTUALS = f"{SpecTokens.DEPENDENCY.name}_virtuals"
+_EDGE_SUBSTITUTE = f"{SpecTokens.DEPENDENCY.name}_substitute"
+_END_EDGE_VIRTUALS = f"{SpecTokens.END_EDGE_PROPERTIES.name}_virtuals"
+_END_EDGE_SUBSTITUTE = f"{SpecTokens.END_EDGE_PROPERTIES.name}_substitute"
+_GIT_VERSION = f"{SpecTokens.VERSION.name}_git_version"
+_VERSION_LIST = f"{SpecTokens.VERSION.name}_version_list"
+_BV_PREFIX = f"{SpecTokens.BOOL_VARIANT.name}_bv_prefix"
+_BV_NAME = f"{SpecTokens.BOOL_VARIANT.name}_bv_name"
+_KV_NAME = f"{SpecTokens.KEY_VALUE_PAIR.name}_kv_name"
+_KV_SEP = f"{SpecTokens.KEY_VALUE_PAIR.name}_kv_sep"
+_KV_VALUE = f"{SpecTokens.KEY_VALUE_PAIR.name}_kv_value"
+
 
 class SpecParser:
     """Fast spec parser using a single compiled regex.
@@ -416,7 +442,7 @@ class SpecParser:
         match = scanner.match()
         while match:
             kind = match.lastgroup
-            if kind == "UNEXPECTED":
+            if kind == _UNEXPECTED:
                 self._raise_tokenization_error()
             full_match = match.group(match.lastgroup)
             if with_subgroups:
@@ -450,14 +476,14 @@ class SpecParser:
         if not self.curr:
             return initial_spec
 
-        if self.curr.lastgroup == "UNEXPECTED":
+        if self.curr.lastgroup == _UNEXPECTED:
             self._raise_tokenization_error()
 
         root_spec = self._parse_node(initial_spec)
         current_spec = root_spec
 
         while self.curr:
-            if self.curr.lastgroup == "DEPENDENCY":
+            if self.curr.lastgroup == _DEPENDENCY:
                 # ^ (transitive) or % / %% (direct) edge, followed by a dependency node
                 token = self.curr.group()
                 # Strip leading whitespace for checking startswith
@@ -467,7 +493,7 @@ class SpecParser:
                 if is_direct and token.startswith("%%"):
                     propagation = PropagationPolicy.PREFERENCE
 
-                if self.curr.group("DEPENDENCY_edge_bracket"):
+                if self.curr.group(_EDGE_BRACKET):
                     # Bracketed form with edge properties: ^[key=value ...] node.
                     # Accept the opening ^[ / %[ token
                     self.curr, self.next = self.next, self.scanner.match()
@@ -476,15 +502,15 @@ class SpecParser:
                     attributes = {}
                     substitute = None
                     while self.curr:
-                        if self.curr.lastgroup == "KEY_VALUE_PAIR":
-                            name = self.curr.group("KEY_VALUE_PAIR_kv_name")
+                        if self.curr.lastgroup == _KEY_VALUE_PAIR:
+                            name = self.curr.group(_KV_NAME)
                             if name not in ("deptypes", "virtuals", "when"):
                                 msg = (
                                     "the only edge attributes that are currently accepted "
                                     'are "deptypes", "virtuals", and "when"'
                                 )
                                 self._raise_parsing_error(msg)
-                            value = self.curr.group("KEY_VALUE_PAIR_kv_value")
+                            value = self.curr.group(_KV_VALUE)
                             value = strip_quotes_and_unescape(value)
                             # Split by comma for list values
                             value_list = [v.strip() for v in value.split(",")]
@@ -492,11 +518,11 @@ class SpecParser:
 
                             self.curr, self.next = self.next, self.scanner.match()
 
-                        elif self.curr.lastgroup == "END_EDGE_PROPERTIES":
+                        elif self.curr.lastgroup == _END_EDGE_PROPERTIES:
                             # Closing ], optionally fused with a virtual assignment, as in
                             # ^[deptypes=link] mpi=openmpi
-                            virtuals_str = self.curr.group("END_EDGE_PROPERTIES_virtuals")
-                            substitute = self.curr.group("END_EDGE_PROPERTIES_substitute")
+                            virtuals_str = self.curr.group(_END_EDGE_VIRTUALS)
+                            substitute = self.curr.group(_END_EDGE_SUBSTITUTE)
 
                             if virtuals_str:
                                 virtuals = attributes.get("virtuals", [])
@@ -547,8 +573,8 @@ class SpecParser:
                 else:
                     # Plain form without brackets: ^node / %node, where the edge token may
                     # carry a virtual assignment, as in %c,cxx=gcc
-                    virtuals_str = self.curr.group("DEPENDENCY_virtuals")
-                    substitute = self.curr.group("DEPENDENCY_substitute")
+                    virtuals_str = self.curr.group(_EDGE_VIRTUALS)
+                    substitute = self.curr.group(_EDGE_SUBSTITUTE)
 
                     virtuals_tuple = tuple(virtuals_str.split(",")) if virtuals_str else ()
 
@@ -576,7 +602,7 @@ class SpecParser:
                     except spack.error.SpecError as e:
                         self._raise_parsing_error(str(e))
 
-            elif self.curr.lastgroup == "UNEXPECTED":
+            elif self.curr.lastgroup == _UNEXPECTED:
                 self._raise_tokenization_error()
 
             else:
@@ -614,23 +640,23 @@ class SpecParser:
             return spec
         kind = curr.lastgroup
         value = curr.group(kind)
-        if kind == "UNQUALIFIED_PACKAGE_NAME":
+        if kind == _UNQUALIFIED_PACKAGE_NAME:
             if value != "*":  # `*` is an anonymous node, as in `%*+shared`
                 spec.name = value
             curr = next
             next = scanner.match() if curr is not None else None
-        elif kind == "FULLY_QUALIFIED_PACKAGE_NAME":
+        elif kind == _FULLY_QUALIFIED_PACKAGE_NAME:
             spec.namespace, spec.name = value.rsplit(".", 1)
             curr = next
             next = scanner.match() if curr is not None else None
-        elif kind == "FILENAME":
+        elif kind == _FILENAME:
             # A spec file is a complete node: read it and return
             if not os.path.exists(value):
                 raise spack.error.NoSuchSpecFileError(f"No such spec file: '{value}'")
             spec._dup(spack.spec.Spec.from_specfile(value))
             self.curr, self.next = next, scanner.match()
             return spec
-        elif kind == "UNEXPECTED":
+        elif kind == _UNEXPECTED:
             self._raise_tokenization_error()
         # else: no name; fall through to attributes of an anonymous node
 
@@ -639,23 +665,23 @@ class SpecParser:
         while curr:
             kind = curr.lastgroup
 
-            if kind == "VERSION":
+            if kind == _VERSION:
                 if has_version:
                     self.curr = curr
                     self._raise_parsing_error("Spec cannot have multiple versions")
 
-                if curr.group("VERSION_git_version"):
+                if curr.group(_GIT_VERSION):
                     spec.versions = spack.version.VersionList(
-                        [spack.version.GitVersion(curr.group("VERSION_git_version"))]
+                        [spack.version.GitVersion(curr.group(_GIT_VERSION))]
                     )
                     spec.attach_git_version_lookup()
                 else:
-                    spec.versions = spack.version.VersionList(curr.group("VERSION_version_list"))
+                    spec.versions = spack.version.VersionList(curr.group(_VERSION_LIST))
                 has_version = True
 
-            elif kind == "BOOL_VARIANT":
-                prefix = curr.group("BOOL_VARIANT_bv_prefix")
-                name = curr.group("BOOL_VARIANT_bv_name")
+            elif kind == _BOOL_VARIANT:
+                prefix = curr.group(_BV_PREFIX)
+                name = curr.group(_BV_NAME)
                 propagate = len(prefix) == 2
                 value = prefix.startswith("+")
                 try:
@@ -664,10 +690,10 @@ class SpecParser:
                     self.curr = curr
                     self._raise_parsing_error(str(e))
 
-            elif kind == "KEY_VALUE_PAIR":
-                name = curr.group("KEY_VALUE_PAIR_kv_name")
-                sep = curr.group("KEY_VALUE_PAIR_kv_sep")
-                value = curr.group("KEY_VALUE_PAIR_kv_value")
+            elif kind == _KEY_VALUE_PAIR:
+                name = curr.group(_KV_NAME)
+                sep = curr.group(_KV_SEP)
+                value = curr.group(_KV_VALUE)
                 propagate = "==" in sep
                 concrete = sep.startswith(":")
                 try:
@@ -676,7 +702,7 @@ class SpecParser:
                     self.curr = curr
                     self._raise_parsing_error(str(e))
 
-            elif kind == "DAG_HASH":
+            elif kind == _DAG_HASH:
                 if spec.abstract_hash:
                     # A second hash belongs to the next spec, e.g. `spack find /abc /def`
                     break

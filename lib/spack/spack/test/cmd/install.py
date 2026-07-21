@@ -25,6 +25,7 @@ import spack.hash_types as ht
 import spack.hooks.sbom_generate
 import spack.old_installer
 import spack.package_base
+import spack.reporters.cdash
 import spack.store
 import spack.util.filesystem as fs
 from spack.error import SpackError, SpecSyntaxError
@@ -86,19 +87,19 @@ def _check_runtests_all(pkg):
 
 
 @pytest.mark.disable_clean_stage_check
-def test_install_runtests_notests(monkeypatch, mock_packages, install_mockery):
+def test_install_runtests_notests(monkeypatch, mock_packages, mock_fetch, install_mockery):
     monkeypatch.setattr(spack.package_base.PackageBase, "_unit_test_check", _check_runtests_none)
     install("-v", "dttop")
 
 
 @pytest.mark.disable_clean_stage_check
-def test_install_runtests_root(monkeypatch, mock_packages, install_mockery):
+def test_install_runtests_root(monkeypatch, mock_packages, mock_fetch, install_mockery):
     monkeypatch.setattr(spack.package_base.PackageBase, "_unit_test_check", _check_runtests_dttop)
     install("--test=root", "dttop")
 
 
 @pytest.mark.disable_clean_stage_check
-def test_install_runtests_all(monkeypatch, mock_packages, install_mockery):
+def test_install_runtests_all(monkeypatch, mock_packages, mock_fetch, install_mockery):
     monkeypatch.setattr(spack.package_base.PackageBase, "_unit_test_check", _check_runtests_all)
     install("--test=all", "pkg-a")
 
@@ -555,11 +556,18 @@ def test_cdash_report_concretization_error(
         assert any(x in content for x in expected_messages)
 
 
+def _noop_cdash_upload(self, filename):
+    """Module-level so it can be pickled into the build child process."""
+    return None
+
+
 @pytest.mark.not_on_windows("Windows log_output logs phase header out of order")
 @pytest.mark.disable_clean_stage_check
 def test_cdash_upload_build_error(
-    capfd, tmp_path: pathlib.Path, mock_fetch, install_mockery, installer_variant
+    capfd, tmp_path: pathlib.Path, mock_fetch, install_mockery, installer_variant, monkeypatch
 ):
+    # the cdash upload url is fake; never upload reports to it
+    monkeypatch.setattr(spack.reporters.cdash.CDash, "upload", _noop_cdash_upload)
     with fs.working_dir(str(tmp_path)):
         with pytest.raises(SpackError):
             install(
@@ -850,7 +858,16 @@ def test_install_no_add_in_env(
 
         # Without --add, ensure that two packages "a" get installed
         inst_out = install("--fake", "pkg-a")
-        assert len([x for x in e.all_specs() if x.installed and x.name == "pkg-a"]) == 2
+        assert (
+            len(
+                [
+                    x
+                    for x in e.all_specs()
+                    if spack.store.STORE.db.installed(x) and x.name == "pkg-a"
+                ]
+            )
+            == 2
+        )
 
         # Install an unambiguous dependency spec (that already exists as a dep
         # in the environment) and make sure it gets installed (w/ deps),

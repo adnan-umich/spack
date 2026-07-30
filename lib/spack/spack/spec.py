@@ -6323,15 +6323,6 @@ class UnsatisfiableDependencySpecError(spack.error.UnsatisfiableSpecError):
         super().__init__(provided, required, "dependency")
 
 
-class UnconstrainableDependencySpecError(spack.error.SpecError):
-    """Raised when attempting to constrain by an anonymous dependency spec"""
-
-    def __init__(self, spec):
-        msg = "Cannot constrain by spec '%s'. Cannot constrain by a" % spec
-        msg += " spec containing anonymous dependencies"
-        super().__init__(msg)
-
-
 class AmbiguousHashError(spack.error.SpecError):
     def __init__(self, msg, *specs):
         spec_fmt = (

@@ -3037,6 +3037,21 @@ def test_parallel_build_and_test_edges_stay_parallel(mock_packages):
     assert depflags == ["b", "t"]
 
 
+def test_an_unnamed_dependency_merges_as_a_parallel_edge(mock_packages):
+    """An edge whose target has no name requires some dependency to match it, so it rides along as
+    a parallel edge instead of being rejected. The merge takes it from either side."""
+    plain, unnamed = Spec("pkg-a"), Spec("pkg-a ^*@2")
+    assert plain.intersects(unnamed) and unnamed.intersects(plain)
+    forward, backward = meet(plain, unnamed), meet(unnamed, plain)
+    assert forward is not None and backward is not None
+    assert forward.to_dict() == backward.to_dict()
+
+    assert unnamed.satisfies(unnamed)
+    assert unnamed.intersects(unnamed)
+    self_meet = meet(unnamed, unnamed)
+    assert self_meet is not None and self_meet.to_dict() == unnamed.to_dict()
+
+
 def test_copy_does_not_share_flag_instances(mock_packages):
     """CompilerFlag is a mutable string in FlagMap; it should not be shared on copy."""
     old = Spec("pkg-a cflags=-O2 cflags==-g")

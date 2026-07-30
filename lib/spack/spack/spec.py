@@ -66,6 +66,7 @@ from typing import (
     ClassVar,
     Dict,
     Iterable,
+    Iterator,
     List,
     Match,
     NamedTuple,
@@ -1558,17 +1559,19 @@ def _anonymous_star(dep: DependencySpec, dep_format: str) -> str:
     return "*" if dep.spec.architecture else ""
 
 
-def _get_satisfying_edge(lhs_node: "Spec", rhs_edge: DependencySpec) -> Optional[DependencySpec]:
-    """Search for an edge in ``lhs_node`` that satisfies ``rhs_edge``."""
-    # First check direct deps of all types. There is a subtlety: only abstract specs distinguish
-    # between direct and indirect edges, whereas concrete specs always have direct edges (without
-    # setting the direct flag).
+def _satisfying_edges(lhs_node: "Spec", rhs_edge: DependencySpec) -> Iterator[DependencySpec]:
+    """Yield every edge in ``lhs_node`` that satisfies ``rhs_edge``, structurally (node-local,
+    ignoring the target's own dependencies - see ``_edge_satisfies`` for the recursive check),
+    in priority order: direct deps of all types, then the historical compiler node, then a BFS
+    over transitive link/run deps."""
+    # There is a subtlety: only abstract specs distinguish between direct and indirect edges,
+    # whereas concrete specs always have direct edges (without setting the direct flag).
     require_direct = rhs_edge.direct and not lhs_node.concrete
     for lhs_edge in lhs_node.edges_to_dependencies():
         if require_direct and not lhs_edge.direct:
             continue
         if _satisfies_edge(lhs_edge, rhs_edge):
-            return lhs_edge
+            yield lhs_edge
 
     # Include the historical compiler node if available as an ad-hoc edge.
     compiler_spec = lhs_node.annotations.compiler_node_attribute
@@ -1581,10 +1584,10 @@ def _get_satisfying_edge(lhs_node: "Spec", rhs_edge: DependencySpec) -> Optional
             direct=True,
         )
         if _satisfies_edge(compiler_edge, rhs_edge):
-            return compiler_edge
+            yield compiler_edge
 
     if rhs_edge.direct:
-        return None
+        return
 
     # BFS through link/run transitive deps (skip depth 1, already checked).
     depflag = dt.LINK | dt.RUN
@@ -1594,18 +1597,42 @@ def _get_satisfying_edge(lhs_node: "Spec", rhs_edge: DependencySpec) -> Optional
         lhs_edge = queue.popleft()
 
         if _satisfies_edge(lhs_edge, rhs_edge):
-            return lhs_edge
+            yield lhs_edge
 
         for lhs_edge in lhs_edge.spec.edges_to_dependencies(depflag=depflag):
             if id(lhs_edge.spec) not in seen:
                 seen.add(id(lhs_edge.spec))
                 queue.append(lhs_edge)
 
-    return None
+
+def _edge_satisfies(lhs_node: "Spec", rhs_edge: DependencySpec) -> bool:
+    """Whether some edge in ``lhs_node`` satisfies ``rhs_edge``, including ``rhs_edge``'s own
+    further dependencies. Tries every structural candidate rather than just the first: a merge
+    can leave one requirement split across several parallel edges to the same name, so the first
+    edge that matches at the node level is not always the one whose subtree matches a nested
+    requirement. A concrete or leaf child needs no recursion, since ``_satisfies_edge`` has
+    already compared everything there is."""
+    if rhs_edge.spec.concrete or not rhs_edge.spec._dependencies:
+        return next(_satisfying_edges(lhs_node, rhs_edge), None) is not None
+    return any(
+        _node_satisfies(lhs_edge.spec, rhs_edge.spec)
+        for lhs_edge in _satisfying_edges(lhs_node, rhs_edge)
+    )
+
+
+def _node_satisfies(lhs: "Spec", rhs: "Spec") -> bool:
+    """Whether every dependency edge of ``rhs`` is satisfied by some edge of ``lhs``."""
+    for rhs_edge in rhs.edges_to_dependencies():
+        # Skip rhs edges whose when condition doesn't apply to the lhs node.
+        if rhs_edge.when is not EMPTY_SPEC and not lhs.intersects(rhs_edge.when):
+            continue
+        if not _edge_satisfies(lhs, rhs_edge):
+            return False
+    return True
 
 
 def _satisfies_edge(lhs: "DependencySpec", rhs: "DependencySpec") -> bool:
-    """Helper function for satisfaction tests, which checks edge attributes and the target node.
+    """Helper function for satisfaction tests, which checks edge attributes and the child node.
     It skips verification of the parent node."""
     name_mismatch = rhs.spec.name and lhs.spec.name != rhs.spec.name
     if name_mismatch and rhs.spec.name not in lhs.virtuals:
@@ -3353,26 +3380,7 @@ class Spec:
         if not deps or not other._dependencies:
             return True
 
-        stack = [(self, other)]
-
-        while stack:
-            lhs, rhs = stack.pop()
-
-            for rhs_edge in rhs.edges_to_dependencies():
-                # Skip rhs edges whose when condition doesn't apply to the lhs node.
-                if rhs_edge.when is not EMPTY_SPEC and not lhs.intersects(rhs_edge.when):
-                    continue
-
-                lhs_edge = _get_satisfying_edge(lhs, rhs_edge)
-
-                if not lhs_edge:
-                    return False
-
-                # Recursive case: `^zlib %gcc`
-                if not rhs_edge.spec.concrete and rhs_edge.spec._dependencies:
-                    stack.append((lhs_edge.spec, rhs_edge.spec))
-
-        return True
+        return _node_satisfies(self, other)
 
     def _provides_virtual(self, virtual_spec: "Spec") -> bool:
         """Return True if this spec provides the given virtual spec, using the provided virtual

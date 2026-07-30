@@ -2755,6 +2755,17 @@ def test_constrain_does_not_share_flags_or_architecture_with_the_rhs(mock_packag
     assert rhs.to_dict() == before
 
 
+def test_satisfies_tries_every_parallel_edge(mock_packages):
+    """Two edges to one name where neither implies the other are parallel edges, each possibly a
+    different node. Satisfies has to try every one of them, not only the first that matches
+    structurally."""
+    spec = Spec("pkg-a ^[deptypes=link] pkg-b %pkg-c ^[deptypes=build] pkg-b %pkg-e")
+    # each query matches one of the two edges, so whichever edge is stored first, one of the
+    # queries has to look past it
+    assert spec.satisfies("pkg-a ^pkg-b %pkg-c")
+    assert spec.satisfies("pkg-a ^pkg-b %pkg-e")
+
+
 def test_copy_does_not_share_flag_instances(mock_packages):
     """CompilerFlag is a mutable string in FlagMap; it should not be shared on copy."""
     old = Spec("pkg-a cflags=-O2 cflags==-g")
@@ -2763,6 +2774,7 @@ def test_copy_does_not_share_flag_instances(mock_packages):
     for x, y in zip(old.compiler_flags["cflags"], new.compiler_flags["cflags"]):
         assert x is not y
         assert x == y and x.propagate == y.propagate and x.flag_group == y.flag_group
+
 
 
 @pytest.mark.parametrize(

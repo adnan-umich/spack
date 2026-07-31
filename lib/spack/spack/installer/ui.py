@@ -181,9 +181,12 @@ class TerminalUI(InstallerUI):
         color: Optional[bool] = None,
         verbose: bool = False,
         filter_padding: bool = False,
+        show_log_on_error: bool = False,
     ) -> None:
         super().__init__()
         self.reads_terminal_input = True
+        #: How many trailing lines of a failed build's log to show, or None for the whole log.
+        self.log_tail: Optional[int] = None if show_log_on_error else 20
         if stdout is None:
             stdout = cast(io.TextIOWrapper, sys.stdout)
             if is_tty is None:
@@ -456,7 +459,7 @@ class TerminalUI(InstallerUI):
             return
         out = io.StringIO()
         with open(build_info.log_path, encoding="utf-8", errors="replace") as f:
-            write_log_context(out, f, tail=20)
+            write_log_context(out, f, tail=self.log_tail)
         build_info.log_summary = out.getvalue() or None
 
     def on_finished(self, failures: List[str]) -> None:

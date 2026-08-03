@@ -617,6 +617,13 @@ class ArchSpec:
         if not other.intersects(self):
             raise UnsatisfiableArchitectureSpecError(other, self)
 
+        return self._merge(other)
+
+    def _merge(self, other: "ArchSpec") -> bool:
+        """Intersect self with other in place, and return True iff self changed.
+
+        Precondition: the two intersect, so this never raises with platform and os applied
+        but not the target."""
         constrained = False
         for attr in ("platform", "os"):
             svalue, ovalue = getattr(self, attr), getattr(other, attr)
@@ -763,6 +770,18 @@ class DeprecatedCompilerSpec(lang.DeprecatedProperty):
         raise AttributeError(f"{instance} has no C, C++, or Fortran compiler")
 
 
+def _merged_when(lhs: "Spec", rhs: "Spec") -> "Spec":
+    """The condition under which an edge merged from two edges applies: the broader of the two,
+    or the merged edge would stop applying in cases the broader side required it in."""
+    if lhs.satisfies(rhs):
+        return rhs
+    if rhs.satisfies(lhs):
+        return lhs
+    merged = lhs.copy()
+    merged.constrain(rhs)
+    return merged
+
+
 @lang.lazy_lexicographic_ordering(set_hash=False)
 class DependencySpec:
     """DependencySpecs represent an edge in the DAG, and contain dependency types
@@ -847,10 +866,40 @@ class DependencySpec:
             when=self.when,
         )
 
-    def _constrain(self, other: "DependencySpec") -> bool:
-        """Constrain this edge with another edge. Precondition: parent and child of self and other
-        are compatible, and both edges have the same when condition. Used as an internal helper
-        function in Spec.constrain.
+    def _disjoint_reason(self, other: "DependencySpec") -> Optional[spack.error.SpecError]:
+        """Why the children of two edges about to merge (one dependency per ``_same_direct_dep``,
+        or one implying the other) cannot be a single node, or None when they can.
+        Precondition of :meth:`_merge`, and mirrors it: a node named after a virtual takes the
+        name of the one providing it, so that is the one dimension the two need not already
+        agree on."""
+        renamed = self.spec.name != other.spec.name and (
+            self.spec.name in other.virtuals or other.spec.name in self.virtuals
+        )
+        if not renamed or self.spec.concrete or other.spec.concrete:
+            return self.spec._disjoint_reason(other.spec, deps=True)
+        error = self.spec._disjoint_node_content_reason(other.spec)
+        if error is not None:
+            return error
+        return self.spec._disjoint_dependencies_reason(other.spec)
+
+    def _conflict_reason(self, other: "DependencySpec") -> Optional[spack.error.SpecError]:
+        """The :meth:`Spec._conflict_reason` counterpart of :meth:`_disjoint_reason`: a pair of
+        edges internal to one child counts as a constraint of that child, not as a conflict,
+        and merges in as it is. This is the precondition the merge itself asserts, so it can
+        only fail on pairs the constrain pre-check already compared."""
+        renamed = self.spec.name != other.spec.name and (
+            self.spec.name in other.virtuals or other.spec.name in self.virtuals
+        )
+        if not renamed or self.spec.concrete or other.spec.concrete:
+            return self.spec._conflict_reason(other.spec)
+        error = self.spec._disjoint_node_content_reason(other.spec)
+        if error is not None:
+            return error
+        return self.spec._conflicting_dependencies_reason(other.spec)
+
+    def _merge(self, other: "DependencySpec") -> bool:
+        """Merge another edge into this one. Precondition: :meth:`_disjoint_reason` or
+        :meth:`_conflict_reason` returned None, so this never raises.
 
         Args:
             other: edge to use as constraint
@@ -859,7 +908,22 @@ class DependencySpec:
             True if the current edge was changed, False otherwise.
         """
         changed = False
-        changed |= self.spec.constrain(other.spec)
+        # A node named after a virtual becomes the package providing it, and a node without a
+        # name takes the name of the other side. The dependency map of each of its dependents is
+        # keyed by name, so both renames go through them; assigning the name directly would leave
+        # the node keyed under its old name.
+        if self.spec.name in other.virtuals:
+            changed = True
+            _rename_node(self.spec, other.spec.name)
+        elif not self.spec.name and other.spec.name:
+            changed = True
+            _rename_node(self.spec, other.spec.name)
+        if self.when != other.when:
+            merged_when = _merged_when(self.when, other.when)
+            if merged_when is not self.when:
+                changed = True
+                self.when = merged_when
+        changed |= self.spec._merge(other.spec, deps=True)
         changed |= self.update_deptypes(other.depflag)
         changed |= self.update_virtuals(other.virtuals)
         if not self.direct and other.direct:
@@ -1001,9 +1065,6 @@ class FlagMap(lang.HashableMap[str, List[CompilerFlag]]):
     def satisfies(self, other):
         return all(f in self and set(self[f]) >= set(other[f]) for f in other)
 
-    def intersects(self, other):
-        return True
-
     def constrain(self, other):
         """Add all flags in other that aren't in self to self.
 
@@ -1134,6 +1195,25 @@ def _add_edge_to_map(edge_map: EdgeMap, key: str, edge: DependencySpec) -> None:
         lst.sort()
     else:
         edge_map[key] = [edge]
+
+
+def _rename_node(spec: "Spec", name: str) -> None:
+    """Rename a node, keeping the dependency map of each of its dependents keyed by the new name.
+
+    Used when the merge resolves a node named after a virtual into the provider it is merged
+    with. Never raises."""
+    incoming = spec.edges_from_dependents()
+    for edge in incoming:
+        siblings = [e for e in edge.parent._dependencies[spec.name] if e is not edge]
+        if siblings:
+            edge.parent._dependencies[spec.name] = siblings
+        else:
+            del edge.parent._dependencies[spec.name]
+
+    spec.name = name
+
+    for edge in incoming:
+        _add_edge_to_map(edge.parent._dependencies, name, edge)
 
 
 def _select_edges(
@@ -1559,10 +1639,28 @@ def _anonymous_star(dep: DependencySpec, dep_format: str) -> str:
     return "*" if dep.spec.architecture else ""
 
 
+def _same_direct_dep(lhs: DependencySpec, rhs: DependencySpec) -> bool:
+    """Two edges of one parent refer to the same dependency when they are direct deps, refer to the
+    same package name, and have the same when condition.
+
+    Note that concrete specs exist that can have two distinct providers for a single virtual, so
+    we do not combine ``^virtual=x ^virtual=y``; we only enforce uniqueness on direct deps."""
+    return (
+        lhs.direct
+        and rhs.direct
+        and bool(lhs.spec.name)
+        and lhs.spec.name == rhs.spec.name
+        and lhs.when == rhs.when
+    )
+
+
 def _satisfying_edges(lhs_node: "Spec", rhs_edge: DependencySpec) -> Iterator[DependencySpec]:
     """Yield every edge in ``lhs_node`` that satisfies ``rhs_edge``, structurally (node-local,
-    ignoring the target's own dependencies - see ``_edge_satisfies`` for the recursive check),
-    in priority order: direct deps of all types, then the historical compiler node, then a BFS
+    ignoring the child's own dependencies - see ``_edge_satisfies`` for the recursive check).
+
+    ``rhs_edge`` is an existential requirement: one matching edge of ``lhs_node`` satisfies it.
+    An indirect one is matched anywhere in the transitive graph, which is why the search widens
+    from the direct dependencies of all types, through the historical compiler node, to a BFS
     over transitive link/run deps."""
     # There is a subtlety: only abstract specs distinguish between direct and indirect edges,
     # whereas concrete specs always have direct edges (without setting the direct flag).
@@ -1624,11 +1722,58 @@ def _node_satisfies(lhs: "Spec", rhs: "Spec") -> bool:
     """Whether every dependency edge of ``rhs`` is satisfied by some edge of ``lhs``."""
     for rhs_edge in rhs.edges_to_dependencies():
         # Skip rhs edges whose when condition doesn't apply to the lhs node.
-        if rhs_edge.when is not EMPTY_SPEC and not lhs.intersects(rhs_edge.when):
+        if rhs_edge.when is not EMPTY_SPEC and not lhs._condition_can_hold(rhs_edge.when):
             continue
         if not _edge_satisfies(lhs, rhs_edge):
             return False
     return True
+
+
+def _condition_must_hold(when: "Spec", node: "Spec") -> bool:
+    """The dual of :meth:`Spec._condition_can_hold`: whether the node alone guarantees an edge's
+    when condition, i.e. it constrains no dependencies and the node satisfies it. A condition
+    that does constrain dependencies is never decided by the node, so it counts as undecided
+    here even where the surrounding graph satisfies it. The constrain pre-check, the merge and
+    canonicalization all use this predicate and must agree; only the node is stable across the
+    three, since the merge reshapes edges mid-flight."""
+    if when is EMPTY_SPEC:
+        return True
+    return not when._dependencies and node.satisfies(when, deps=False)
+
+
+def _must_hold_predicate(lhs: "Spec", rhs: "Spec") -> Callable[["Spec"], bool]:
+    """Predicate telling whether an edge's when condition must hold for the meet of two nodes.
+    The merged node is built on first use: most edges decide on EMPTY_SPEC conditions alone.
+    Precondition: node compatibility of lhs and rhs was already checked."""
+    merged_node: Optional["Spec"] = None
+
+    def must_hold(when: "Spec") -> bool:
+        nonlocal merged_node
+        if when is EMPTY_SPEC:
+            return True
+        if merged_node is None:
+            merged_node = lhs.copy(deps=False)
+            merged_node._merge(rhs, deps=False)
+        return _condition_must_hold(when, merged_node)
+
+    return must_hold
+
+
+def _implies_edge(narrower: DependencySpec, wider: DependencySpec) -> bool:
+    """Whether every DAG satisfying ``narrower`` also satisfies ``wider``, which makes ``wider``
+    redundant."""
+    # A direct dependency can only be implied by another direct dependency. _satisfies_edge
+    # does not compare this itself: its other caller, _satisfying_edges, filters on it
+    # externally, on fully built specs, unlike _add_or_merge_edge, whose parent node can still
+    # be under construction.
+    if not (narrower.direct or not wider.direct):
+        return False
+    if not _satisfies_edge(narrower, wider):
+        return False
+    # _satisfies_edge compares node-local attributes only, so a dependency of wider's child
+    # that narrower's lacks has to survive: the two are independent requirements, and one edge
+    # requiring both at once is narrower than their meet.
+    return not wider.spec._dependencies or narrower.spec.satisfies(wider.spec)
 
 
 def _satisfies_edge(lhs: "DependencySpec", rhs: "DependencySpec") -> bool:
@@ -2013,56 +2158,167 @@ class Spec:
             propagation: propagation policy for this edge
             when: optional condition under which dependency holds
         """
-        if when is None:
-            when = EMPTY_SPEC
+        self.add_dependency_edge(
+            spec,
+            depflag=depflag,
+            virtuals=virtuals,
+            direct=direct,
+            when=when,
+            propagation=propagation,
+        )
 
-        if spec.name not in self._dependencies or not spec.name:
-            self.add_dependency_edge(
-                spec,
-                depflag=depflag,
-                virtuals=virtuals,
-                direct=direct,
-                when=when,
-                propagation=propagation,
-            )
-            return
+    def _add_or_merge_edge(
+        self, candidate: DependencySpec, owned: bool = True
+    ) -> Tuple[bool, DependencySpec]:
+        """Add ``candidate`` as a dependency edge.
 
-        # Keep the intersection of constraints when a dependency is added multiple times with
-        # the same deptype. Add a new dependency if it is added with a compatible deptype
-        # (for example, a build-only dependency is compatible with a link-only dependency).
-        # The only restrictions, currently, are that we cannot add edges with overlapping
-        # dependency types and we cannot add multiple edges that have link/run dependency types.
-        # See ``spack.deptypes.compatible``.
-        orig = self._dependencies[spec.name]
-        try:
-            dspec = next(
-                dspec for dspec in orig if depflag == dspec.depflag and when == dspec.when
-            )
-        except StopIteration:
-            # Error if we have overlapping or incompatible deptypes
-            if any(not dt.compatible(dspec.depflag, depflag) for dspec in orig) and all(
-                dspec.when == when for dspec in orig
-            ):
-                edge_attrs = f"deptypes={dt.flag_to_chars(depflag).strip()}"
-                required_dep_str = f"^[{edge_attrs}] {str(spec)}"
+        With ``owned`` False the candidate's child still belongs to another DAG: a merge only
+        reads it, and an append replaces it with a copy first.
 
-                raise DuplicateDependencyError(
-                    f"{spec.name} is a duplicate dependency, with conflicting dependency types\n"
-                    f"\t'{str(self)}' cannot depend on '{required_dep_str}'"
-                )
+        An existing edge is merged into ``candidate`` when the two can only ever be realized by a
+        single dependency (``_same_direct_dep``), or when one of them implies the other
+        (``_implies_edge``), which makes a pure duplicate redundant and otherwise still picks
+        up anything ``_implies_edge`` does not itself compare, such as ``direct``. A
+        ``_same_direct_dep`` pair is only merged where its when condition must hold: while it
+        is undecided, a concretization can falsify it and need the edges apart.
 
-            self.add_dependency_edge(
-                spec, depflag=depflag, virtuals=virtuals, direct=direct, when=when
-            )
-            return
+        Anything else is a new constraint and is appended as a parallel edge. Whether it ends up
+        sharing a node with another edge to the same name is for concretization to decide. The one
+        exception is a node's direct provider set: each virtual comes from exactly one direct
+        dependency, so an unconditional direct edge whose virtuals a differently named
+        unconditional direct edge already lists is refused.
 
-        try:
-            dspec.spec.constrain(spec)
-            dspec.update_virtuals(virtuals=virtuals)
-        except spack.error.UnsatisfiableSpecError:
-            raise DuplicateDependencyError(
-                f"Cannot depend on incompatible specs '{dspec.spec}' and '{spec}'"
-            )
+        Returns whether ``self`` changed, and the edge that carries the candidate's constraint
+        afterwards: ``candidate`` itself if it was appended, or the existing edge it was merged
+        into.
+
+        Raises:
+            spack.error.SpecError: if two edges that can only be a single dependency have
+                children that do not intersect, or if a second direct provider is refused.
+                ``constrain`` never reaches either, since ``_disjoint_reason`` makes the same
+                checks first; direct callers have no such pre-check, and can find ``self``
+                partially merged when the child check fires.
+        """
+
+        # _condition_must_hold reads node attributes only, like _disjoint_dependencies_reason,
+        # so the pre-check and the merge make the same decision. During parsing self is still
+        # under construction. Root attributes precede % edges in the grammar, so the decision
+        # matches the finished node there too.
+        #
+        # Every scan below loops over the buckets of self._dependencies directly, in the order
+        # edges_to_dependencies flattens them in, and skips edges its predicate rejects on the
+        # child's name alone: _satisfies_edge satisfies a named rhs only by an lhs of the same
+        # name or one whose virtuals list it, and an unnamed rhs by any lhs. The filters read
+        # edge.spec.name, not the bucket key: a merge that names a node leaves it keyed under
+        # its old name in the maps of its dependents.
+        name = candidate.spec.name
+        partner: Optional[DependencySpec] = None
+        if name and _condition_must_hold(candidate.when, self):
+            for edges in self._dependencies.values():
+                for edge in edges:
+                    if _same_direct_dep(edge, candidate):
+                        partner = edge
+                        break
+                if partner is not None:
+                    break
+        group = [partner] if partner is not None else []
+
+        # Implication is one-sided. Only the first edge implying `candidate` makes it redundant:
+        # two edges that both imply it need not imply each other, and the parent is free to meet
+        # them with two nodes. Any number of edges `candidate` implies are all redundant once it
+        # is in, so those are discarded together.
+        redundant = False
+        if not group:
+            for edges in self._dependencies.values():
+                for edge in edges:
+                    if name and edge.spec.name != name and name not in edge.virtuals:
+                        continue
+                    if _implies_edge(edge, candidate):
+                        group.append(edge)
+                        redundant = True
+                        break
+                if redundant:
+                    break
+
+        # Newly appended edges cannot recur in the scan, so comparing against the head of the
+        # group is the whole membership check.
+        head = group[0] if group else None
+        for edges in self._dependencies.values():
+            for edge in edges:
+                if (
+                    edge.spec.name
+                    and edge.spec.name != name
+                    and edge.spec.name not in candidate.virtuals
+                ):
+                    continue
+                if edge is not head and _implies_edge(candidate, edge):
+                    group.append(edge)
+
+        # Each virtual of a node comes from exactly one of its direct dependencies, so a direct
+        # candidate bringing a virtual that a differently named direct edge already lists can
+        # never be concretized. Adding an edge compares when conditions with each other, never
+        # against the node, so only unconditional pairs are refused here; conditional ones are
+        # left to intersects/constrain, which have the nodes of self and other.
+        if (
+            not redundant
+            and candidate.direct
+            and candidate.virtuals
+            and name
+            and candidate.when is EMPTY_SPEC
+        ):
+            for edges in self._dependencies.values():
+                for edge in edges:
+                    if (
+                        edge.direct
+                        and edge.spec.name
+                        and edge.spec.name != name
+                        and edge.when is EMPTY_SPEC
+                        and not any(edge is member for member in group)
+                    ):
+                        for virtual in candidate.virtuals:
+                            if virtual in edge.virtuals:
+                                raise spack.error.SpecError(
+                                    f"two direct dependencies cannot both provide '{virtual}': "
+                                    f"'{edge.spec.name}' and '{candidate.spec.name}'"
+                                )
+
+        if not group:
+            if not owned:
+                candidate.spec = candidate.spec.copy(deps=True)
+            _add_edge_to_map(self._dependencies, candidate.spec.name, candidate)
+            _add_edge_to_map(candidate.spec._dependents, self.name, candidate)
+            return True, candidate
+
+        # The survivor keeps its identity, and so its spot in self._dependencies. Each check is
+        # against the running merge rather than against `candidate`, so a dimension that three
+        # edges narrow between them ends up narrowed by all three.
+        survivor, changed = group[0], False
+        for edge in [candidate, *group[1:]]:
+            error = survivor._conflict_reason(edge)
+            if error is not None:
+                raise error
+            merged = survivor._merge(edge)
+            if edge is candidate:
+                changed = merged
+            else:
+                # self loses an edge here whatever _merge reports, unlike when `candidate` itself
+                # is the redundant one and brings no edge.
+                self._detach_edge(edge)
+                changed = True
+        return changed, survivor
+
+    def _detach_edge(self, edge: DependencySpec) -> None:
+        """Remove an edge from this spec and from the dependents of the node it points at."""
+        self._dependencies[edge.spec.name] = [
+            e for e in self._dependencies[edge.spec.name] if e is not edge
+        ]
+        # Not a keyed lookup: self may have been anonymous when the edge was added and named only
+        # later by a merge, leaving edge.spec._dependents keyed by the stale (possibly empty)
+        # name rather than self.name as it is now.
+        for name, dependents in edge.spec._dependents.items():
+            if any(e is edge for e in dependents):
+                edge.spec._dependents[name] = [e for e in dependents if e is not edge]
+                break
 
     def add_dependency_edge(
         self,
@@ -2087,47 +2343,16 @@ class Spec:
         if when is None:
             when = EMPTY_SPEC
 
-        # Check if we need to update edges that are already present
-        selected = self._dependencies.get(dependency_spec.name, [])
-        for edge in selected:
-            has_errors, details = False, []
-            msg = f"cannot update the edge from {edge.parent.name} to {edge.spec.name}"
-
-            if edge.when != when:
-                continue
-
-            # If the dependency is to an existing spec, we can update dependency
-            # types. If it is to a new object, check deptype compatibility.
-            if id(edge.spec) != id(dependency_spec) and not dt.compatible(edge.depflag, depflag):
-                has_errors = True
-                details.append(
-                    (
-                        f"{edge.parent.name} has already an edge matching any"
-                        f" of these types {depflag}"
-                    )
-                )
-
-                if any(v in edge.virtuals for v in virtuals):
-                    details.append(
-                        (
-                            f"{edge.parent.name} has already an edge matching any"
-                            f" of these virtuals {virtuals}"
-                        )
-                    )
-
-            if has_errors:
-                raise spack.error.SpecError(msg, "\n".join(details))
-
-        for edge in selected:
+        # An edge object already registered on both the parent and the child is updated in place,
+        # rather than treated as a second, competing constraint: both sides have to see the same
+        # modification.
+        for edge in self._dependencies.get(dependency_spec.name, []):
             if id(dependency_spec) == id(edge.spec) and edge.when == when:
-                # If we are here, it means the edge object was previously added to
-                # both the parent and the child. When we update this object they'll
-                # both see the deptype modification.
                 edge.update_deptypes(depflag=depflag)
                 edge.update_virtuals(virtuals=virtuals)
                 return
 
-        edge = DependencySpec(
+        candidate = DependencySpec(
             self,
             dependency_spec,
             depflag=depflag,
@@ -2136,8 +2361,7 @@ class Spec:
             propagation=propagation,
             when=when,
         )
-        _add_edge_to_map(self._dependencies, edge.spec.name, edge)
-        _add_edge_to_map(dependency_spec._dependents, edge.parent.name, edge)
+        self._add_or_merge_edge(candidate)
 
     #
     # Public interface
@@ -3156,52 +3380,234 @@ class Spec:
         return self._constrain(other, deps=deps)
 
     def _constrain(self, other, deps=True):
-        # If we are trying to constrain a concrete spec, either the spec
-        # already satisfies the constraint (and the method returns False)
-        # or it raises an exception
-        if self.concrete:
-            if self.satisfies(other):
-                return False
-            else:
-                raise spack.error.UnsatisfiableSpecError(self, other, "constrain a concrete spec")
-
         other = self._autospec(other)
-        if other.concrete and other.satisfies(self):
+
+        # A concrete other that already implies self is copied over.
+        if other.concrete and not self.concrete and other.satisfies(self):
             self._dup(other)
             return True
 
-        if other.abstract_hash:
-            if not self.abstract_hash or other.abstract_hash.startswith(self.abstract_hash):
-                self.abstract_hash = other.abstract_hash
-            elif not self.abstract_hash.startswith(other.abstract_hash):
-                raise InvalidHashError(self, other.abstract_hash)
+        error = self._disjoint_reason(other, deps=deps)
+        if error is not None:
+            raise error
 
-        if not (self.name == other.name or (not self.name) or (not other.name)):
-            raise UnsatisfiableSpecNameError(self.name, other.name)
+        # A concrete self that intersects the constraint is a no-op.
+        if self.concrete:
+            return False
 
+        return self._merge(other, deps=deps)
+
+    def _disjoint_reason(self, other: "Spec", deps: bool) -> Optional[spack.error.SpecError]:
+        """Return None when at least one concrete spec matches both self and other, otherwise
+        the reason the two are disjoint.
+
+        Args:
+            other: spec to intersect with
+            deps: if True compare dependency edges too, if False only the node
+        """
+        if other is EMPTY_SPEC:
+            return None
+
+        # A concrete spec is a singleton, so intersection reduces to satisfaction. deps is not
+        # forwarded here: a concrete side is compared whole.
+        if self.concrete or other.concrete:
+            lhs, rhs = (self, other) if self.concrete else (other, self)
+            if lhs.satisfies(rhs):
+                return None
+            return spack.error.UnsatisfiableSpecError(self, other, "constrain a concrete spec")
+
+        error = self._disjoint_node_reason(other)
+        if error is not None or not deps:
+            return error
+
+        return self._disjoint_dependencies_reason(other)
+
+    def _conflict_reason(self, other: "Spec") -> Optional[spack.error.SpecError]:
+        """Return None unless self and other conflict with each other, otherwise the reason.
+
+        Weaker than :meth:`_disjoint_reason`: a pair of direct dependencies internal to one
+        side counts as a constraint of that side, not as a conflict, so a meet that is empty
+        for internal reasons only is not a conflict. This is the question a caller can safely
+        act on by deleting or skipping an edge whose when condition cannot hold: an internal
+        pair may be exactly what falsifies the condition, and a deletion it justified would
+        remove the constraint that justified it."""
+        if other is EMPTY_SPEC:
+            return None
+
+        # A concrete spec is a singleton with no internal pairs, so both questions reduce to
+        # satisfaction there.
+        if self.concrete or other.concrete:
+            lhs, rhs = (self, other) if self.concrete else (other, self)
+            if lhs.satisfies(rhs):
+                return None
+            return spack.error.UnsatisfiableSpecError(self, other, "constrain a concrete spec")
+
+        error = self._disjoint_node_reason(other)
+        if error is not None:
+            return error
+
+        return self._conflicting_dependencies_reason(other)
+
+    def _disjoint_node_reason(self, other: "Spec") -> Optional[spack.error.SpecError]:
+        """Node half of :meth:`_disjoint_reason`, which never looks at edges.
+
+        Precondition: neither side is concrete."""
+        # Two abstract nodes with different names do not intersect. Looking up whether one
+        # provides the other would make intersection stateful.
+        if self.name != other.name and self.name and other.name:
+            return UnsatisfiableSpecNameError(self.name, other.name)
+
+        return self._disjoint_node_content_reason(other)
+
+    def _disjoint_node_content_reason(self, other: "Spec") -> Optional[spack.error.SpecError]:
+        """The dimensions of :meth:`_disjoint_node_reason` other than the name. Used on its own
+        when two edges are known to point at one node through a virtual, where the node named
+        after the virtual takes the name of the one providing it, so the two names need not
+        already agree."""
+        if not self.versions.intersects(other.versions):
+            return UnsatisfiableVersionSpecError(self.versions, other.versions)
+
+        return self._disjoint_node_attributes_reason(other)
+
+    def _disjoint_node_attributes_reason(self, other: "Spec") -> Optional[spack.error.SpecError]:
+        """The dimensions of :meth:`_disjoint_node_reason` that do not depend on how the name and
+        the version were matched: abstract hash, namespace, variants and architecture."""
         if (
-            other.namespace is not None
-            and self.namespace is not None
-            and other.namespace != self.namespace
+            self.abstract_hash
+            and other.abstract_hash
+            and not self.abstract_hash.startswith(other.abstract_hash)
+            and not other.abstract_hash.startswith(self.abstract_hash)
         ):
-            raise UnsatisfiableSpecNameError(self.fullname, other.fullname)
+            return InvalidHashError(self, other.abstract_hash)
 
-        if not self.versions.overlaps(other.versions):
-            raise UnsatisfiableVersionSpecError(self.versions, other.versions)
-
-        for v in [x for x in other.variants if x in self.variants]:
-            if not self.variants[v].intersects(other.variants[v]):
-                raise vt.UnsatisfiableVariantSpecError(self.variants[v], other.variants[v])
-
-        sarch, oarch = self.architecture, other.architecture
         if (
-            sarch is not None
-            and oarch is not None
+            self.namespace is not None
+            and other.namespace is not None
+            and self.namespace != other.namespace
+        ):
+            return UnsatisfiableSpecNameError(self.fullname, other.fullname)
+
+        self_variants = self.variants.dict
+        for name, other_variant in other.variants.dict.items():
+            self_variant = self_variants.get(name)
+            if self_variant is not None and not self_variant.intersects(other_variant):
+                return vt.UnsatisfiableVariantSpecError(self_variant, other_variant)
+
+        if (
+            self.architecture is not None
+            and other.architecture is not None
             and not self.architecture.intersects(other.architecture)
         ):
-            raise UnsatisfiableArchitectureSpecError(sarch, oarch)
+            return UnsatisfiableArchitectureSpecError(self.architecture, other.architecture)
 
+        # Compiler flags always intersect, since merging them is a union.
+        return None
+
+    def _disjoint_dependencies_reason(self, other: "Spec") -> Optional[spack.error.SpecError]:
+        """Dependency half of :meth:`_disjoint_reason`.
+
+        Most edge pairs coexist: ``^foo@1`` and ``^foo@2`` meet at ``^foo@1 ^foo@2``. Only direct
+        deps can conflict, for two reasons: either they refer to the same package with
+        conflicting constraints (``%gcc@10`` and ``%gcc@11``), or they refer to different packages
+        but require the same virtual (``c=gcc`` and ``c=llvm``). The former is a check over all
+        direct edges to one name at once, as a running merge, since three children can intersect
+        pairwise and still share nothing (``@1:2``, ``@2:3`` and ``@1,3``).
+
+        With conditional edges, these conflicts arise only where both when conditions must hold for
+        the merged node, for example ``foo+x %[when='+y'] bar@1`` and ``foo+y %[when='+x'] bar@2``
+        conflict because their meet satisfies both when conditions. That extends to two edges of
+        one spec: ``foo %[when='+x'] pkg@1 %[when='+x'] pkg@2`` conflicts with plain ``foo+x``,
+        which contributes no edge at all. Reading such internal pairs is what separates this
+        from :meth:`_conflicting_dependencies_reason`."""
+        if not self._dependencies and not other._dependencies:
+            return None
+
+        must_hold = _must_hold_predicate(self, other)
+
+        # Spack allows a single virtual to be provided by multiple dependencies in the closure
+        # of link/run deps combined with direct build deps. That means an abstract spec of the
+        # form ^foo=bar ^foo=baz is valid. But %foo=bar %foo=baz is invalid, because one node
+        # can only depend on a single package providing a virtual. It is only valid to talk
+        # about multiple direct deps providing the same virtual while their when conditions
+        # remain undecided.
+        provider: Dict[str, str] = {}
+
+        # A node has at most one direct dependency per package name, so all direct edges to one
+        # name whose conditions must hold point at a single node.
+        groups: Dict[str, List[DependencySpec]] = {}
+
+        for edge in itertools.chain(self.edges_to_dependencies(), other.edges_to_dependencies()):
+            name = edge.spec.name
+            if not edge.direct or not name or not must_hold(edge.when):
+                continue
+            groups.setdefault(name, []).append(edge)
+            for virtual in edge.virtuals:
+                if provider.setdefault(virtual, name) != name:
+                    return UnsatisfiableDependencySpecError(other, self)
+
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            accumulated: Optional[DependencySpec] = None
+            try:
+                for i, edge in enumerate(group[1:], 1):
+                    base = accumulated if accumulated is not None else group[0]
+                    if base._disjoint_reason(edge) is not None:
+                        return UnsatisfiableDependencySpecError(other, self)
+                    # Avoid a copy in the common case of <= 2 edges.
+                    if i < len(group) - 1:
+                        if accumulated is None:
+                            accumulated = group[0].copy()
+                            accumulated.spec = group[0].spec.copy(deps=True)
+                        accumulated._merge(edge)
+            except spack.error.SpecError:
+                return UnsatisfiableDependencySpecError(other, self)
+
+        return None
+
+    def _conflicting_dependencies_reason(self, other: "Spec") -> Optional[spack.error.SpecError]:
+        """Dependency half of :meth:`_conflict_reason`: only cross pairs are consulted, one
+        direct edge from each side. A pair conflicts in one of two shapes, and only where both
+        when conditions must hold for the merged node: two edges to one name whose children
+        cannot be one node, or two edges to different names required to provide the same
+        virtual. While either when condition is undecided, a pair stays as parallel edges: a
+        concretization can falsify the condition and keep the other edge."""
+        if not self._dependencies or not other._dependencies:
+            return None
+
+        must_hold = _must_hold_predicate(self, other)
+
+        for a in self.edges_to_dependencies():
+            if not a.direct or not a.spec.name:
+                continue
+            for b in other.edges_to_dependencies():
+                if not b.direct or not b.spec.name:
+                    continue
+                provider_pair = a.spec.name != b.spec.name and any(
+                    virtual in b.virtuals for virtual in a.virtuals
+                )
+                same_name_pair = a.spec.name == b.spec.name
+                if not provider_pair and not same_name_pair:
+                    continue
+                if not must_hold(a.when) or not must_hold(b.when):
+                    continue
+                if provider_pair or a._disjoint_reason(b) is not None:
+                    return UnsatisfiableDependencySpecError(other, self)
+
+        return None
+
+    def _merge(self, other: "Spec", deps: bool) -> bool:
+        """Intersect self with other in place, and return True iff self changed.
+
+        Precondition: :meth:`_disjoint_reason` returned None. Every step below is check-free,
+        so no path applies part of the intersection and then raises."""
         changed = False
+
+        if other.abstract_hash and (
+            not self.abstract_hash or len(other.abstract_hash) > len(self.abstract_hash)
+        ):
+            self.abstract_hash = other.abstract_hash
+            changed = True
 
         if not self.name and other.name:
             self.name = other.name
@@ -3212,55 +3618,98 @@ class Spec:
             changed = True
 
         changed |= self.versions.intersect(other.versions)
-        changed |= self._constrain_variants(other)
-
+        changed |= self._merge_variants(other)
         changed |= self.compiler_flags.constrain(other.compiler_flags)
 
-        sarch, oarch = self.architecture, other.architecture
-        if sarch is not None and oarch is not None:
-            changed |= self.architecture.constrain(other.architecture)
-        elif oarch is not None:
-            # copy, so that a later constrain on self does not write through into other
-            self.architecture = oarch.copy()
+        if self.architecture is not None and other.architecture is not None:
+            changed |= self.architecture._merge(other.architecture)
+        elif other.architecture is not None:
+            # copy, so that a later merge on self does not write through into other
+            self.architecture = other.architecture.copy()
             changed = True
 
         if deps:
-            changed |= self._constrain_dependencies(other)
+            changed |= self._merge_dependencies(other)
 
         return changed
 
-    def _constrain_dependencies(self, other: "Spec") -> bool:
-        """Apply constraints of other spec's dependencies to this spec."""
-        if not other._dependencies:
-            return False
-
-        # TODO: might want more detail than this, e.g. specific deps
-        # in violation. if this becomes a priority get rid of this
-        # check and be more specific about what's wrong.
-        if not other._intersects_dependencies(self):
-            raise UnsatisfiableDependencySpecError(other, self)
-
-        for d in other.traverse(root=False):
-            if not d.name:
-                raise UnconstrainableDependencySpecError(other)
+    def _merge_variants(self, other: "Spec") -> bool:
+        """Add the variants of other, merging the ones already present. Never raises."""
         changed = False
-        for other_edge in other.edges_to_dependencies():
-            # Find the first edge in self that matches other_edge by name and when clause.
-            for self_edge in self.edges_to_dependencies(other_edge.spec.name):
-                if self_edge.when == other_edge.when:
-                    changed |= self_edge._constrain(other_edge)
-                    break
-            else:
-                # Otherwise, a copy of the edge is added as a constraint to self.
+        for name, other_variant in other.variants.items():
+            self_variant = self.variants.get(name)
+            if self_variant is None:
+                self.variants[name] = other_variant.copy()
                 changed = True
-                self.add_dependency_edge(
-                    other_edge.spec.copy(deps=True),
-                    depflag=other_edge.depflag,
-                    virtuals=other_edge.virtuals,
-                    direct=other_edge.direct,
-                    propagation=other_edge.propagation,
-                    when=other_edge.when,  # no need to copy; when conditions are immutable
-                )
+            else:
+                changed |= self_variant._merge(other_variant)
+        return changed
+
+    def _merge_dependencies(self, other: "Spec") -> bool:
+        """Add the edges of other, merging the ones it shares with self, then canonicalize the
+        conditional edges: the meet is narrower than self and other, so it can decide a when
+        condition that was undecided on both. Never raises when self and other are canonical:
+        every pair an edge made unconditional can conflict with was flagged by
+        ``_disjoint_dependencies_reason`` first."""
+        pre = {id(edge): edge.when for edge in self.edges_to_dependencies()}
+        mutated: Set[int] = set()
+        for other_edge in other.edges_to_dependencies():
+            candidate = DependencySpec(
+                self,
+                other_edge.spec,
+                depflag=other_edge.depflag,
+                virtuals=other_edge.virtuals,
+                direct=other_edge.direct,
+                propagation=other_edge.propagation,
+                when=other_edge.when,  # no need to copy; when conditions are immutable
+            )
+            edge_changed, survivor = self._add_or_merge_edge(candidate, owned=False)
+            if edge_changed and survivor is not candidate:
+                mutated.add(id(survivor))
+
+        self._canonicalize_conditional_edges()
+
+        # An edge added from other and dropped again leaves no trace, so the changed flag comes
+        # from what survived: the edge set, the merges into pre-existing edges, and the when
+        # conditions the canonicalization removed in place.
+        post = {id(edge): edge.when for edge in self.edges_to_dependencies()}
+        return (
+            pre.keys() != post.keys()
+            or any(edge_id in post for edge_id in mutated)
+            or any(pre[edge_id] is not post[edge_id] for edge_id in pre.keys() & post.keys())
+        )
+
+    def _canonicalize_conditional_edges(self) -> bool:
+        """Drop every out-edge whose when condition cannot hold for this node, and make every
+        edge whose when condition must hold unconditional, merging it with any edge that
+        became its equal. A falsified condition makes its edge vacuous and a satisfied one is
+        redundant, so neither rewrite changes the set of concrete specs described. Both
+        verdicts are stable under narrowing, which keeps the rewrites aligned with constrain.
+        A condition that constrains dependencies is never decided by the node, so its edge
+        stays conditional. Returns whether self changed.
+
+        Raises spack.error.SpecError when an edge made unconditional merges with an
+        incompatible edge, which is a description of the empty set caught early. ``constrain``
+        never reaches the raise: ``_disjoint_dependencies_reason`` flags the same pairs first,
+        via the same must-hold check."""
+        changed, dirty = False, True
+        while dirty:
+            # A rewrite mutates the edge list, so each round scans a fresh snapshot. Every
+            # rewrite reduces the number of conditional edges by at least one, so this ends.
+            dirty = False
+            for edge in self.edges_to_dependencies():
+                if edge.when is EMPTY_SPEC:
+                    continue
+                if not self._condition_can_hold(edge.when):
+                    self._detach_edge(edge)
+                elif _condition_must_hold(edge.when, self):
+                    self._detach_edge(edge)
+                    edge.when = EMPTY_SPEC
+                    self._add_or_merge_edge(edge)
+                else:
+                    continue
+                changed = dirty = True
+                break
         return changed
 
     def constrained(self, other, deps=True):
@@ -3290,76 +3739,14 @@ class Spec:
             other: spec to be checked for compatibility
             deps: if True check compatibility of dependency nodes too, if False only check root
         """
-        if other is EMPTY_SPEC:
-            return True
-        other = self._autospec(other)
+        return self._disjoint_reason(self._autospec(other), deps=deps) is None
 
-        if other.concrete and self.concrete:
-            return self.dag_hash() == other.dag_hash()
-
-        elif self.concrete:
-            return self.satisfies(other)
-
-        elif other.concrete:
-            return other.satisfies(self)
-
-        # From here we know both self and other are not concrete
-        self_hash = self.abstract_hash
-        other_hash = other.abstract_hash
-
-        if (
-            self_hash
-            and other_hash
-            and not (self_hash.startswith(other_hash) or other_hash.startswith(self_hash))
-        ):
-            return False
-
-        # Two abstract roots with different names do not intersect. We cannot lookup whether the
-        # one spec provides the other, because that would make intersection stateful.
-        if self.name != other.name and self.name and other.name:
-            return False
-
-        # namespaces either match, or other doesn't require one.
-        if (
-            other.namespace is not None
-            and self.namespace is not None
-            and self.namespace != other.namespace
-        ):
-            return False
-
-        if self.versions and other.versions:
-            if not self.versions.intersects(other.versions):
-                return False
-
-        if not self._intersects_variants(other):
-            return False
-
-        if self.architecture and other.architecture:
-            if not self.architecture.intersects(other.architecture):
-                return False
-
-        if not self.compiler_flags.intersects(other.compiler_flags):
-            return False
-
-        # If we need to descend into dependencies, do it, otherwise we're done.
-        if deps:
-            return self._intersects_dependencies(other)
-
-        return True
-
-    def _intersects_dependencies(self, other):
-        if not other._dependencies or not self._dependencies:
-            # one spec *could* eventually satisfy the other
-            return True
-
-        # Handle first-order constraints directly
-        common_dependencies = {x.name for x in self.dependencies()}
-        common_dependencies &= {x.name for x in other.dependencies()}
-        for name in common_dependencies:
-            if not self[name].intersects(other[name], deps=True):
-                return False
-
-        return True
+    def _condition_can_hold(self, when: "Spec") -> bool:
+        """Whether the when condition of an edge can hold for this spec. Built on
+        :meth:`_conflict_reason` rather than ``intersects``: a pair of two edges of this spec
+        may be the very constraint that falsifies the condition, and a reader that skips or
+        deletes a conditional edge based on it would lose that constraint."""
+        return self._conflict_reason(when) is None
 
     def satisfies(self, other: Union[str, "Spec"], deps: bool = True) -> bool:
         """Return True if all concrete specs matching self also match other, otherwise False.
@@ -3505,33 +3892,6 @@ class Spec:
                     return False
 
         return result
-
-    def _intersects_variants(self, other: "Spec") -> bool:
-        self_dict = self.variants.dict
-        other_dict = other.variants.dict
-        return all(self_dict[k].intersects(other_dict[k]) for k in other_dict if k in self_dict)
-
-    def _constrain_variants(self, other: "Spec") -> bool:
-        """Add all variants in other that aren't in self to self. Also constrain all multi-valued
-        variants that are already present. Return True iff self changed"""
-        if other is not None and other._concrete:
-            for k in self.variants:
-                if k not in other.variants:
-                    raise vt.UnsatisfiableVariantSpecError(self.variants[k], "<absent>")
-
-        changed = False
-        for k in other.variants:
-            if k in self.variants:
-                if not self.variants[k].intersects(other.variants[k]):
-                    raise vt.UnsatisfiableVariantSpecError(self.variants[k], other.variants[k])
-                # If they are compatible merge them
-                changed |= self.variants[k].constrain(other.variants[k])
-            else:
-                # If it is not present copy it straight away
-                self.variants[k] = other.variants[k].copy()
-                changed = True
-
-        return changed
 
     @property  # type: ignore[misc] # decorated prop not supported in mypy
     def patches(self):
@@ -3680,7 +4040,7 @@ class Spec:
                 direct=edge.direct,
                 when=edge.when,
             )
-            # Don't use add_dependency_edge here, copy edges verbatim
+            # Don't use _add_or_merge_edge here, copy edges verbatim.
             _add_edge_to_map(new_parent._dependencies, new_child.name, new_edge)
             _add_edge_to_map(new_child._dependents, new_parent.name, new_edge)
 
@@ -5168,6 +5528,15 @@ class SpecBuildInterface(lang.ObjectWrapper, Spec):
         return self.wrapped_obj.copy(*args, **kwargs)
 
 
+def meet(a: Spec, b: Spec) -> Optional[Spec]:
+    """The meet of two specs: a new spec denoting the intersection of the sets they denote, or
+    None when the two are disjoint, since no spec denotes the empty set."""
+    try:
+        return a.constrained(b)
+    except spack.error.SpecError:
+        return None
+
+
 def substitute_abstract_variants(spec: Spec):
     """Uses the information in ``spec.package`` to turn any variant that needs
     it into a SingleValuedVariant or BoolValuedVariant.
@@ -5835,10 +6204,6 @@ class UnsupportedPropagationError(spack.error.SpecError):
     """Raised when propagation (==) is used with reserved variant names."""
 
 
-class DuplicateDependencyError(spack.error.SpecError):
-    """Raised when the same dependency occurs in a spec twice."""
-
-
 class UnsupportedCompilerError(spack.error.SpecError):
     """Raised when the user asks for a compiler spack doesn't know about."""
 
@@ -5972,6 +6337,10 @@ class _ImmutableSpec(Spec):
     def constrain(self, *args, **kwargs) -> bool:
         assert self._mutable
         return super().constrain(*args, **kwargs)
+
+    def _merge(self, *args, **kwargs) -> bool:
+        assert self._mutable
+        return super()._merge(*args, **kwargs)
 
     def add_dependency_edge(self, *args, **kwargs):
         assert self._mutable

@@ -2139,8 +2139,11 @@ def test_abstract_contains_semantic(lhs, rhs, expected, mock_packages):
         # is the family root and broadwell and later are above haswell.
         (Spec, "target=:haswell", "target=x86_64:", (True, True, False)),
         (Spec, "target=:haswell", "target=x86_64_v4:", (False, False, False)),
-        # Edge case of uarch that split in a diamond structure, from a common ancestor
-        (Spec, "target=:cascadelake", "target=:cannonlake", (False, False, False)),
+        # Microarchitectures splitting in a diamond: targets up to the common ancestor (skylake)
+        # are below both bounds, so the ranges intersect without either containing the other.
+        (Spec, "target=:cascadelake", "target=:cannonlake", (True, False, False)),
+        # The same diamond seen from below: targets from icelake up are above both bounds.
+        (Spec, "target=cascadelake:", "target=cannonlake:", (True, False, False)),
         # Spec with compilers
         (Spec, "mpileaks %gcc@5", "mpileaks %gcc@6", (False, False, False)),
         # %gcc sits behind an unpinned ^callpath edge, so callpath need not be one node:

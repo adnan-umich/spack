@@ -55,12 +55,11 @@ concretizer:
       cmake: 2
       gmake: 2
       python: 2
-      python-venv: 2
-      py-cython: 2
+      python-venv: 1
+      py-cython: 1
       py-flit-core: 2
       py-pip: 2
       py-setuptools: 2
-      py-setuptools-scm: 2
       py-versioneer: 2
       py-wheel: 2
       xcb-proto: 2

@@ -893,6 +893,8 @@ class BuildInfo:
         "name",
         "external",
         "prefix",
+        "compiler",
+        "variants",
         "finished_time",
         "start_time",
         "duration",
@@ -917,6 +919,8 @@ class BuildInfo:
         self.name: str = spec.name
         self.external: bool = spec.external
         self.prefix: str = spec.prefix
+        self.compiler: str = spec.compilers.strip() if spec.compilers else ""
+        self.variants: str = spec.format("{variants}")
         self.finished_time: Optional[float] = None
         self.start_time: float = start_time
         self.duration: Optional[float] = None
@@ -1426,6 +1430,22 @@ class BuildStatus:
         yield f"@{build_info.version}"
         if self.color:
             yield "\033[0m"  # reset
+        
+        # compiler
+        if build_info.compiler:
+            if self.color:
+                yield "\033[0;33m"  # yellow
+            yield f" {build_info.compiler}"
+            if self.color:
+                yield "\033[0m"  # reset
+
+        # variants
+        if build_info.variants:
+            if self.color:
+                yield "\033[0;35m"  # magenta
+            yield f" {build_info.variants}"
+            if self.color:
+                yield "\033[0m"  # reset
 
         # progress or state
         if build_info.progress_percent is not None:

@@ -123,13 +123,6 @@ packages:
           c: /usr/bin/gcc
           cxx: /usr/bin/g++
           fortran: /usr/bin/gfortran
-    - spec: gcc@10.3.0 languages:='c,c++,fortran'
-      prefix: /sw/spack/opt/pkgs/gcc/10.3.0-gcc-14.3.1-kgnb
-      extra_attributes:
-        compilers:
-          c: /sw/spack/opt/pkgs/gcc/10.3.0-gcc-14.3.1-kgnb/bin/gcc
-          cxx: /sw/spack/opt/pkgs/gcc/10.3.0-gcc-14.3.1-kgnb/bin/g++
-          fortran: /sw/spack/opt/pkgs/gcc/10.3.0-gcc-14.3.1-kgnb/bin/gfortran
   ##########################################################################################
   #                                       Externals                                        #
   ##########################################################################################

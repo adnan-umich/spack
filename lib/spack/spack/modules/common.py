@@ -774,7 +774,17 @@ class BaseContext(tengine.Context):
 
     def _create_module_list_of(self, what):
         name = self.conf.name
-        return [self.conf.make_layout(x, name).use_name for x in getattr(self.conf, what)]
+        modules = []
+        for spec in getattr(self.conf, what):
+            if spec.installed_upstream:
+                upstream_module = upstream_module_index.upstream_module(
+                    spec, self.conf.module_system
+                )
+                if upstream_module:
+                    modules.append(upstream_module.use_name)
+                    continue
+            modules.append(self.conf.make_layout(spec, name).use_name)
+        return modules
 
     @tengine.context_property
     def verbose(self):

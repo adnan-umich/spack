@@ -29,6 +29,16 @@ help([[{{ long_description| textwrap(72)| join() }}]])
 {% endblock %}
 
 {% block provides %}
+{# A provider alias gives spider the full prerequisite chain. #}
+{% for alias, branches in spider_branches|groupby(0) %}
+if mode() == "spider" and myFileName() == "{{ alias }}" then
+{% for _, path in branches %}
+  prepend_path("MODULEPATH", "{{ path }}")
+{% endfor %}
+  return
+end
+{% endfor %}
+
 {# Prepend the path I unlock as a provider of #}
 {# services and set the families of services I provide #}
 {% if has_modulepath_modifications %}
@@ -53,7 +63,7 @@ local {{ name }}_version = os.getenv("LMOD_{{ name|upper() }}_VERSION")
 
 -- Change MODULEPATH based on the result of the tests above
 {% for condition, path in conditionally_unlocked_paths %}
-if {{ condition }} then
+if mode() ~= "spider" and {{ condition }} then
   local t = pathJoin({{ path }})
   prepend_path("MODULEPATH", t)
 end

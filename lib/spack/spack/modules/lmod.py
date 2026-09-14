@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import collections
+import glob
 import itertools
 import os
 import pathlib
@@ -465,6 +466,57 @@ class LmodContext(BaseContext):
                 value.append((condition, path))
         return value
 
+    def _spider_patterns(self):
+        if not self.has_conditional_modifications:
+            return
+        provided = {
+            self.layout.token_to_path(token, spec) for token, spec in self.conf.provides.items()
+        }
+        for missing, alternatives in self.layout.unlocked_paths.items():
+            if missing is None:
+                continue
+            for parts in alternatives:
+                yield missing, parts, provided
+
+    @tengine.context_property
+    def spider_branches(self):
+        """Provider aliases under the other services, paired with combined module directories."""
+        branches = set()
+        for missing, parts, provided in self._spider_patterns():
+            pattern = os.path.join(
+                *(os.path.join("*", "*") if p in missing else glob.escape(p) for p in parts)
+            )
+            for path in glob.iglob(pattern):
+                if not os.path.isdir(path):
+                    continue
+                components = os.path.relpath(path, parts[0]).split(os.sep)
+                parent, offset = [parts[0]], 0
+                for part in parts[1:]:
+                    length = 2 if part in missing else len(part.split(os.sep))
+                    if part not in provided:
+                        parent.extend(components[offset : offset + length])
+                    offset += length
+                alias = os.path.join(*parent, self.layout.use_name + ".lua")
+                branches.add((alias, path))
+        return sorted(branches)
+
+    def spider_aliases(self):
+        """Find existing aliases, including ones whose combined directory was removed."""
+        for missing, parts, provided in self._spider_patterns():
+            pattern = os.path.join(
+                *(
+                    os.path.join("*", "*") if p in missing else glob.escape(p)
+                    for p in parts
+                    if p not in provided
+                ),
+                glob.escape(self.layout.use_name + ".lua"),
+            )
+            for path in glob.iglob(pattern):
+                if os.path.islink(path) and os.path.realpath(path) == os.path.realpath(
+                    self.layout.filename
+                ):
+                    yield path
+
 
 class LmodModulefileWriter(BaseModuleFileWriter):
     """Writer class for lmod module files."""
@@ -476,6 +528,29 @@ class LmodModulefileWriter(BaseModuleFileWriter):
     modulerc_header = []
 
     hide_cmd_format = 'hide_version("%s")'
+
+    def write(self, overwrite=False):
+        if self.conf.excluded or (not overwrite and os.path.exists(self.layout.filename)):
+            return super().write(overwrite)
+        aliases = {alias for alias, _ in self.context.spider_branches}
+        for alias in aliases:
+            if os.path.lexists(alias) and (
+                not os.path.islink(alias)
+                or os.path.realpath(alias) != os.path.realpath(self.layout.filename)
+            ):
+                raise spack.error.SpackError(f"Provider discovery alias would overwrite {alias}")
+        super().write(overwrite)
+        for stale in set(self.context.spider_aliases()) - aliases:
+            os.unlink(stale)
+        for alias in aliases:
+            if not os.path.lexists(alias):
+                fs.mkdirp(os.path.dirname(alias))
+                os.symlink(self.layout.filename, alias)
+
+    def remove(self):
+        for alias in self.context.spider_aliases():
+            os.unlink(alias)
+        super().remove()
 
 
 class CoreCompilersNotFoundError(spack.error.SpackError, KeyError):

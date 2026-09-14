@@ -56,6 +56,39 @@ def provider(request):
 
 @pytest.mark.usefixtures("mutable_config", "mock_packages")
 class TestLmod:
+    @pytest.mark.parametrize("cleanup", ["refresh", "remove"])
+    def test_spider_provider_aliases(self, module_configuration, factory, cleanup):
+        module_configuration("complex_hierarchy")
+        writer, spec = factory("mpich@3.0.4%clang@15.0.0")
+        root = pathlib.Path(writer.layout.arch_dirname)
+        mpi = writer.layout.token_to_path("mpi", spec)
+        combined = root / mpi / "python/3.12-test/Core"
+        combined.mkdir(parents=True)
+        alias = root / "python/3.12-test/Core" / (writer.layout.use_name + ".lua")
+        writer.write(overwrite=True)
+        assert alias.is_symlink()
+        assert alias.resolve() == pathlib.Path(writer.layout.filename).resolve()
+        assert f'myFileName() == "{alias}"' in alias.read_text()
+        combined.rmdir()
+        if cleanup == "refresh":
+            writer.write(overwrite=True)
+        else:
+            writer.remove()
+        assert not alias.is_symlink()
+
+    def test_spider_alias_does_not_replace_real_provider(self, module_configuration, factory):
+        module_configuration("complex_hierarchy")
+        writer, spec = factory("mpich@3.0.4%clang@15.0.0")
+        root = pathlib.Path(writer.layout.arch_dirname)
+        mpi = writer.layout.token_to_path("mpi", spec)
+        (root / mpi / "python/3.12-test/Core").mkdir(parents=True)
+        alias = root / "python/3.12-test/Core" / (writer.layout.use_name + ".lua")
+        alias.parent.mkdir(parents=True)
+        alias.write_text("existing provider")
+        with pytest.raises(spack.error.SpackError, match="would overwrite"):
+            writer.write(overwrite=True)
+        assert alias.read_text() == "existing provider"
+
     @pytest.mark.regression("37788")
     @pytest.mark.parametrize("modules_config", ["core_compilers", "core_compilers_at_equal"])
     def test_layout_for_specs_compiled_with_core_compilers(

@@ -4,6 +4,10 @@
 -- {{ spec.short_spec }}
 --
 
+{% if spack_environment %}
+-- Spack environment: {{ spack_environment }}
+{% endif %}
+
 {% block header %}
 {% if short_description %}
 whatis([[Name : {{ spec.name }}]])

@@ -237,3 +237,33 @@ packages:
     externals:
     - spec: libpng@1.6.40
       prefix: /usr
+  grep:
+    buildable: false
+    externals:
+      - spec: grep@3.11
+        prefix: /usr
+  sed:
+    buildable: false
+    externals:
+      - spec: sed@4.9
+        prefix: /usr
+  harfbuz:
+    buildable: true
+    externals:
+      - spec: hartfuzz@8.4.0
+        prefix: /usr
+  cairo:
+    buildable: true
+    externals:
+      - spec: cairo@1.54.0
+        prefix: /usr
+  rdma-core:
+    buildable: false
+    externals:
+      - spec: rdma-core@2604.0.7
+        prefix: /usr
+  automake:
+    buildable: true
+    externals:
+      - spec: automake@1.16.5
+        prefix: /usr

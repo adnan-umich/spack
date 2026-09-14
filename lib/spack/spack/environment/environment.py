@@ -2935,6 +2935,7 @@ def display_specs(
     specs: List[spack.spec.Spec],
     *,
     highlight_non_defaults: bool = False,
+    show_types: bool = False,
     status_fn: Optional[Callable[["spack.spec.Spec"], "spack.spec.InstallStatus"]] = None,
 ) -> None:
     """Displays a list of specs traversed breadth-first, covering nodes, with install status.
@@ -2943,6 +2944,7 @@ def display_specs(
         specs: list of specs to be displayed
         highlight_non_defaults: if True, highlights non-default versions and variants in the specs
             being displayed
+        show_types: if True, show the merged dependency types for each node
         status_fn: callable mapping a spec to its InstallStatus; defaults to
             ``spack.spec.Spec.install_status``
     """
@@ -2951,6 +2953,7 @@ def display_specs(
         format=spack.spec.DISPLAY_FORMAT,
         hashes=True,
         hashlen=7,
+        show_types=show_types,
         status_fn=status_fn if status_fn is not None else spack.spec.Spec.install_status,
         highlight_version_fn=(
             spack.package_base.non_preferred_version if highlight_non_defaults else None

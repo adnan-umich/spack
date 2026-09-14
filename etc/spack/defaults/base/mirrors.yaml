@@ -1,4 +1,5 @@
 mirrors:
+  #buildcache: file:///sw/spack/buildcache
   spack-public:
     binary: false
     url: https://mirror.spack.io

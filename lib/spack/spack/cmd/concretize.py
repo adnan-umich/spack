@@ -51,6 +51,7 @@ def concretize(parser, args):
                 ev.display_specs(
                     [concrete for _, concrete in concretized_specs],
                     highlight_non_defaults=args.non_defaults,
+                    show_types=True,
                     status_fn=status_fn,
                 )
             else:

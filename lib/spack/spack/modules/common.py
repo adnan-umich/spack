@@ -590,6 +590,11 @@ class BaseContext(tengine.Context):
     @tengine.context_property
     def category(self):
         return getattr(self.spec, "category", "spack")
+    
+    @tengine.context_property
+    def spack_environment(self) -> Optional[str]:
+        env = spack.environment.active_environment()
+        return env.name if env else None
 
     @tengine.context_property
     def short_description(self):

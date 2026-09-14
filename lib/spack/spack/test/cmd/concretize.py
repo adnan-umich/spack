@@ -5,7 +5,9 @@
 
 import pytest
 
+import spack.deptypes as dt
 import spack.environment as ev
+import spack.spec
 from spack import spack_version
 from spack.main import SpackCommand
 
@@ -17,6 +19,18 @@ concretize = SpackCommand("concretize")
 
 
 unification_strategies = [False, True, "when_possible"]
+
+
+def test_display_specs_shows_dependency_types(capsys):
+    root, build_dep, runtime_dep = map(spack.spec.Spec, ("root", "builder", "runtime"))
+    root.add_dependency_edge(build_dep, depflag=dt.BUILD, virtuals=())
+    root.add_dependency_edge(runtime_dep, depflag=dt.LINK | dt.RUN, virtuals=())
+
+    ev.display_specs([root], show_types=True, status_fn=lambda _: False)
+
+    output = capsys.readouterr().out
+    assert "[b   ]" in output
+    assert "[ lr ]" in output
 
 
 @pytest.mark.parametrize("unify", unification_strategies)

@@ -4,6 +4,7 @@
 
 import os
 import pathlib
+import subprocess
 
 import pytest
 
@@ -64,28 +65,148 @@ class TestLmod:
         mpi = writer.layout.token_to_path("mpi", spec)
         combined = root / mpi / "python/3.12-test/Core"
         combined.mkdir(parents=True)
-        alias = root / "python/3.12-test/Core" / (writer.layout.use_name + ".lua")
+        alias = root / ".spack-spider/python/3.12-test/Core" / (writer.layout.use_name + ".lua")
         writer.write(overwrite=True)
         assert alias.is_symlink()
         assert alias.resolve() == pathlib.Path(writer.layout.filename).resolve()
         assert f'myFileName() == "{alias}"' in alias.read_text()
+        modulerc = alias.parent / ".modulerc.lua"
+        assert 'kind="hard"' in modulerc.read_text()
+        assert str(alias) in modulerc.read_text()
         combined.rmdir()
         if cleanup == "refresh":
             writer.write(overwrite=True)
         else:
             writer.remove()
         assert not alias.is_symlink()
+        assert not modulerc.exists()
 
-    def test_spider_alias_does_not_replace_real_provider(self, module_configuration, factory):
+    @pytest.mark.parametrize("legacy", ["public", "nested", None])
+    def test_spider_alias_upgrade_preserves_modulerc(self, module_configuration, factory, legacy):
         module_configuration("complex_hierarchy")
         writer, spec = factory("mpich@3.0.4%clang@15.0.0")
         root = pathlib.Path(writer.layout.arch_dirname)
         mpi = writer.layout.token_to_path("mpi", spec)
         (root / mpi / "python/3.12-test/Core").mkdir(parents=True)
-        alias = root / "python/3.12-test/Core" / (writer.layout.use_name + ".lua")
+        parent = root / "python/3.12-test/Core"
+        private = pathlib.Path(writer.layout.spider_path(str(parent)))
+        location = {"public": parent, "nested": parent / ".spack-spider", None: private}[legacy]
+        alias = location / (writer.layout.use_name + ".lua")
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(writer.layout.filename)
+        modulerc = alias.parent / ".modulerc.lua"
+        original = '-- Site policy\nmodule_version("another/1", "default")\n'
+        modulerc.write_text(original)
+        writer.write(overwrite=True)
+        writer.write(overwrite=True)
+        assert modulerc.read_text().startswith(original)
+        assert modulerc.read_text().count('kind="hard"') == (0 if legacy else 1)
+        if legacy:
+            assert not alias.is_symlink()
+            assert (private / (writer.layout.use_name + ".lua")).is_symlink()
+        writer.remove()
+        assert modulerc.read_text() == original
+
+    @pytest.mark.parametrize("python_first", [True, False])
+    def test_spider_aliases_with_lmod(self, module_configuration, factory, tmp_path, python_first):
+        """Discovery must preserve combined prerequisites without shadowing providers."""
+        lmod = os.environ.get("LMOD_CMD")
+        if not lmod or not os.path.isfile(lmod):
+            pytest.skip("requires an installed Lmod (8.8+), with LMOD_CMD set")
+        module_configuration("complex_hierarchy")
+        config = writer_cls.configuration_class.configuration("default")
+        config["all"]["autoload"] = "none"
+        config["hierarchy"] = ["python", "mpi"] if python_first else ["mpi", "python"]
+        mpi, mpi_spec = factory("mpich@3.0.4%clang@15.0.0")
+        python, python_spec = factory("python@3.8.0")
+        root = pathlib.Path(mpi.layout.arch_dirname)
+        parts = [
+            mpi.layout.token_to_path("mpi", mpi_spec),
+            python.layout.token_to_path("python", python_spec),
+        ]
+        if python_first:
+            parts.reverse()
+        combined = root.joinpath(*parts, "Core")
+        child = combined / "combined/1.lua"
+        child.parent.mkdir(parents=True)
+        child.write_text('setenv("SPACK_COMBINED_TEST", "loaded")\n')
+        mpi.write(overwrite=True)
+        python.write(overwrite=True)
+        env = {
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path),
+            "MODULEPATH": str(root / "Core"),
+            "LMOD_CACHED_LOADS": "no",
+        }
+
+        def spider(name, *flags):
+            result = subprocess.run(
+                [lmod, "bash", "--ignore_cache", *flags, "spider", name],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            return result.stderr
+
+        for provider in (mpi, python):
+            for flags in ((), ("--show_hidden",)):
+                output = spider(provider.layout.use_name, *flags)
+                assert "This module can be loaded directly" in output
+                assert "Additional variants" not in output
+        output = spider("combined/1")
+        assert mpi.layout.use_name in output and python.layout.use_name in output
+        assert "This module can be loaded directly" not in output
+        assert ".spack-spider" not in output
+
+        for first, second in ((mpi, python), (python, mpi)):
+            result = subprocess.run(
+                [
+                    "bash",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    'eval "$("$1" bash load "$2" "$3" combined/1)"\n'
+                    'test "$SPACK_COMBINED_TEST" = loaded || exit 1\n'
+                    'case "$MODULEPATH" in *".spack-spider"*) exit 3;; esac\n'
+                    'printf "%s\\n" "$_LMFILES_"\n'
+                    'eval "$("$1" bash unload combined/1 "$3")"\n'
+                    'case ":$MODULEPATH:" in *":$4:"*) exit 2;; esac\n',
+                    "test-lmod",
+                    lmod,
+                    first.layout.use_name,
+                    second.layout.use_name,
+                    str(combined),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            loaded = result.stdout.strip().split(":")
+            assert mpi.layout.filename in loaded
+            assert python.layout.filename in loaded
+            assert str(child) in loaded
+
+    @pytest.mark.parametrize("private", [True, False])
+    def test_spider_alias_does_not_replace_real_provider(
+        self, module_configuration, factory, private
+    ):
+        module_configuration("complex_hierarchy")
+        writer, spec = factory("mpich@3.0.4%clang@15.0.0")
+        root = pathlib.Path(writer.layout.arch_dirname)
+        mpi = writer.layout.token_to_path("mpi", spec)
+        (root / mpi / "python/3.12-test/Core").mkdir(parents=True)
+        parent = root / "python/3.12-test/Core"
+        alias = (pathlib.Path(writer.layout.spider_path(str(parent))) if private else parent) / (
+            writer.layout.use_name + ".lua"
+        )
         alias.parent.mkdir(parents=True)
         alias.write_text("existing provider")
-        with pytest.raises(spack.error.SpackError, match="would overwrite"):
+        if private:
+            with pytest.raises(spack.error.SpackError, match="would overwrite"):
+                writer.write(overwrite=True)
+        else:
             writer.write(overwrite=True)
         assert alias.read_text() == "existing provider"
 

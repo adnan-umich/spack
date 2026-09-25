@@ -5,6 +5,7 @@
 import collections
 import glob
 import itertools
+import json
 import os
 import pathlib
 import warnings
@@ -284,6 +285,12 @@ class LmodFileLayout(BaseFileLayout):
         """Returns the modulerc file associated with current module file"""
         return os.path.join(os.path.dirname(self.filename), f".modulerc.{self.extension}")
 
+    def spider_path(self, path):
+        """Mirror a hierarchy outside every directory used for normal loading."""
+        relative = os.path.relpath(path, self.arch_dirname)
+        root = os.path.join(self.arch_dirname, ".spack-spider")
+        return root if relative == "." else os.path.join(root, relative)
+
     def token_to_path(self, name, value):
         """Transforms a hierarchy token into the corresponding path part.
 
@@ -490,7 +497,7 @@ class LmodContext(BaseContext):
                 if not os.path.isdir(path):
                     continue
                 components = os.path.relpath(path, parts[0]).split(os.sep)
-                parent, offset = [parts[0]], 0
+                parent, offset = [self.layout.spider_path(parts[0])], 0
                 for part in parts[1:]:
                     length = 2 if part in missing else len(part.split(os.sep))
                     if part not in provided:
@@ -500,22 +507,37 @@ class LmodContext(BaseContext):
                 branches.add((alias, path))
         return sorted(branches)
 
+    @tengine.context_property
+    def spider_paths(self):
+        paths = set(self.unlocked_paths)
+        paths.update(path for _, path in self.spider_branches)
+        return {path: self.layout.spider_path(path) for path in paths}
+
     def spider_aliases(self):
         """Find existing aliases, including ones whose combined directory was removed."""
         for missing, parts, provided in self._spider_patterns():
-            pattern = os.path.join(
+            parent_pattern = os.path.join(
                 *(
                     os.path.join("*", "*") if p in missing else glob.escape(p)
                     for p in parts
                     if p not in provided
-                ),
-                glob.escape(self.layout.use_name + ".lua"),
+                )
             )
-            for path in glob.iglob(pattern):
-                if os.path.islink(path) and os.path.realpath(path) == os.path.realpath(
-                    self.layout.filename
-                ):
-                    yield path
+            # Also clean up public aliases generated before discovery was isolated.
+            parents = (
+                parent_pattern,
+                os.path.join(parent_pattern, ".spack-spider"),
+                parent_pattern.replace(
+                    glob.escape(parts[0]), glob.escape(self.layout.spider_path(parts[0])), 1
+                ),
+            )
+            for parent in parents:
+                pattern = os.path.join(parent, glob.escape(self.layout.use_name + ".lua"))
+                for path in glob.iglob(pattern):
+                    if os.path.islink(path) and os.path.realpath(path) == os.path.realpath(
+                        self.layout.filename
+                    ):
+                        yield path
 
 
 class LmodModulefileWriter(BaseModuleFileWriter):
@@ -528,6 +550,34 @@ class LmodModulefileWriter(BaseModuleFileWriter):
     modulerc_header = []
 
     hide_cmd_format = 'hide_version("%s")'
+
+    @staticmethod
+    def update_spider_alias_hiddenness(alias, remove=False):
+        """Keep discovery aliases out of avail, spider results and module loading.
+
+        Lmod still traverses hard-hidden modulefiles when building its MODULEPATH
+        graph. Match the filename, not the module name: the real provider must
+        remain visible. Requires Lmod's hide{kind="hard"} support (8.8+).
+        """
+        modulerc = pathlib.Path(alias).parent / ".modulerc.lua"
+        command = 'hide{name=%s,kind="hard"} -- Spack spider alias' % json.dumps(
+            str(alias), ensure_ascii=False
+        )
+        content = modulerc.read_text(encoding="utf-8") if modulerc.exists() else ""
+        lines = content.splitlines(keepends=True)
+        if remove:
+            updated = "".join(line for line in lines if line.rstrip("\r\n") != command)
+        elif any(line.rstrip("\r\n") == command for line in lines):
+            return
+        else:
+            updated = content + ("\n" if content and not content.endswith("\n") else "")
+            updated += command + "\n"
+        if updated == content:
+            return
+        if updated:
+            modulerc.write_text(updated, encoding="utf-8")
+        else:
+            modulerc.unlink()
 
     def write(self, overwrite=False):
         if self.conf.excluded or (not overwrite and os.path.exists(self.layout.filename)):
@@ -542,14 +592,17 @@ class LmodModulefileWriter(BaseModuleFileWriter):
         super().write(overwrite)
         for stale in set(self.context.spider_aliases()) - aliases:
             os.unlink(stale)
+            self.update_spider_alias_hiddenness(stale, remove=True)
         for alias in aliases:
+            fs.mkdirp(os.path.dirname(alias))
+            self.update_spider_alias_hiddenness(alias)
             if not os.path.lexists(alias):
-                fs.mkdirp(os.path.dirname(alias))
                 os.symlink(self.layout.filename, alias)
 
     def remove(self):
         for alias in self.context.spider_aliases():
             os.unlink(alias)
+            self.update_spider_alias_hiddenness(alias, remove=True)
         super().remove()
 
 

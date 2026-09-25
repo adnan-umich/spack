@@ -34,6 +34,7 @@ help([[{{ long_description| textwrap(72)| join() }}]])
 if mode() == "spider" and myFileName() == "{{ alias }}" then
 {% for _, path in branches %}
   prepend_path("MODULEPATH", "{{ path }}")
+  prepend_path("MODULEPATH", "{{ spider_paths[path] }}")
 {% endfor %}
   return
 end
@@ -50,6 +51,10 @@ family("{{ name }}")
 -- Loading this module unlocks the path below unconditionally
 {% for path in unlocked_paths %}
 prepend_path("MODULEPATH", "{{ path }}")
+-- Discovery helpers must never enter the MODULEPATH used for loading.
+if mode() == "spider" then
+  prepend_path("MODULEPATH", "{{ spider_paths[path] }}")
+end
 {% endfor %}
 
 {# Try to see if missing providers have already #}

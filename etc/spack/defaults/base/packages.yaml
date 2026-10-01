@@ -267,3 +267,13 @@ packages:
     externals:
       - spec: automake@1.16.5
         prefix: /usr
+  libarchive:
+    buildable: true
+    externals:
+      - spec: libarchive@3.7.7
+        prefix: /usr
+  libcap:
+    buildable: true
+    externals:
+      - spec: libcap@2.69
+        prefix: /usr

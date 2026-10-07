@@ -28,6 +28,7 @@ import collections
 import contextlib
 import copy
 import datetime
+import json
 import os
 import re
 import string
@@ -241,6 +242,16 @@ upstream_module_index = Singleton(_generate_upstream_module_index)
 
 
 ModuleIndexEntry = collections.namedtuple("ModuleIndexEntry", ["path", "use_name"])
+
+
+@memoized
+def dependency_ownership():
+    """Names (or None for exclusions) supplied by the ownership-aware Lmod refresh."""
+    path = os.environ.get("SPACK_LMOD_DEPENDENCY_OWNERS")
+    if not path:
+        return {}
+    with open(path, encoding="utf-8") as stream:
+        return json.load(stream)
 
 
 def read_module_index(root):
@@ -490,7 +501,12 @@ class BaseConfiguration:
 
     def _create_list_for(self, what):
         include = []
+        owners = dependency_ownership() if self.module_system == "lmod" else {}
         for item in self.conf[what]:
+            if item.dag_hash() in owners:
+                if owners[item.dag_hash()] is not None:
+                    include.append(item)
+                continue
             if not self.make_configuration(item, self.name).excluded:
                 include.append(item)
         return include
@@ -780,7 +796,12 @@ class BaseContext(tengine.Context):
     def _create_module_list_of(self, what):
         name = self.conf.name
         modules = []
+        owners = dependency_ownership() if self.conf.module_system == "lmod" else {}
         for spec in getattr(self.conf, what):
+            if spec.dag_hash() in owners:
+                if owners[spec.dag_hash()] is not None:
+                    modules.append(owners[spec.dag_hash()])
+                continue
             if spec.installed_upstream:
                 upstream_module = upstream_module_index.upstream_module(
                     spec, self.conf.module_system

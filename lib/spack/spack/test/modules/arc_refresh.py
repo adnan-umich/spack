@@ -26,6 +26,9 @@ def test_refresh_only_owned_specs(tmp_path, owned_count):
         "if sys.argv[3] == 'find':\n"
         f"    print('\\n'.join({[shared] + owned!r} if sys.argv[2] == 'child' "
         f"else {[shared]!r}))\n"
+        "elif sys.argv[3] == 'python':\n"
+        "    print(json.dumps({h: {'path': '/modules/' + h + '.lua', "
+        "'use_name': h} for h in json.load(sys.stdin)}))\n"
     )
     fake_spack.chmod(0o755)
     script = pathlib.Path(spack.paths.share_path) / "arc/refresh-owned-modules.py"
